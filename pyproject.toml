@@ -1,0 +1,13 @@
+[project]
+name = "bad-apple"
+version = "0.1.0"
+description = "Make bad apple with any video/image collection!"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "opencv-python>=4.13.0.92",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
