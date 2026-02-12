@@ -3,11 +3,11 @@
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Python](https://img.shields.io/badge/Python-3.14+-3776AB?logo=python)](https://www.python.org/)
 
-<picture align="center">
-    ![Bad Apple](./docs/images/frame_00552.png)
-</picture>
+<p align="center">
+    <img align="center" src="./docs/images/frame_00552.png">
+</p>
 
-Recreate Bad Apple (or any video, really) frame-by-frame using the most visually similar images from a gallery.
+<p align="center"><i>Recreate Bad Apple frame by frame!</i></p>
 
 ## How it works
 
