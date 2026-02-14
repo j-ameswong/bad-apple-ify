@@ -16,6 +16,7 @@ class Config:
     source_fps: int = 30
     output_fps: int = 30
     aspect_ratio: tuple = ASPECT_RATIOS[0]
+    save_source: bool = False
     img_format: Literal["png", "jpg"] = "png"
     grid_size: int = 16
 
@@ -24,10 +25,11 @@ class Config:
             raise ValueError(f"{self.aspect_ratio} is not a valid aspect ratio, "
                 " please select from {self.ASPECT_RATIOS}")
 
-def extract_frames(config: Config, input_dir: str, output_dir: str):
+def extract_frames(config: Config, input_dir: str, output_dir: str) -> np.ndarray:
     """Extract and convert all frames to grayscale"""
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    if config.save_source:
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(input_dir)
     if not cap.isOpened():
@@ -38,27 +40,63 @@ def extract_frames(config: Config, input_dir: str, output_dir: str):
     config.output_fps = config.source_fps
 
     # Calculate nearest Config.ASPECT_RATIOS
-    source_ratio = cap.get(cv2.CAP_PROP_FRAME_WIDTH) / float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    diffs = [abs(source_ratio - (ratio[0] / float(ratio[1]))) for ratio in config.ASPECT_RATIOS] 
+    source_ratio = [int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))]
+    diffs = [abs((source_ratio[0] / source_ratio[1])
+                 - (ratio[0] / float(ratio[1])))
+             for ratio in config.ASPECT_RATIOS] 
+
     config.aspect_ratio = config.ASPECT_RATIOS[diffs.index(min(diffs))]
 
+    # grid here is the new pixelised array, higher res by increasing grid_size
+    grid = tuple(x * config.grid_size for x in config.aspect_ratio)
+    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # initialize output array
+    output_data = np.empty((num_frames, grid[1], grid[0]), dtype=np.float32)
+
     # Extract frames with progress bar
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    for f in tqdm.tqdm(range(total_frames), desc="Extracting frames..."):
+    for f in tqdm.tqdm(range(num_frames), desc="Extracting frames..."):
         ret, frame = cap.read()
 
-        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", grey)
+        output_data[f] = fingerprint(frame, grid)
+        if config.save_source:
+            to_write = cv2.resize((output_data[f] * 255.0).astype(np.uint8),
+                                  (source_ratio[0], source_ratio[1]),
+                                  interpolation=cv2.INTER_NEAREST)
+
+            cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", to_write)
 
     cap.release()
+    return output_data
 
+def fingerprint(img: np.ndarray, grid: tuple) -> np.ndarray:
+    """Returns brightness fingerprint by averaging grid cells"""
+
+    grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(grey, grid, interpolation=cv2.INTER_AREA)
+    return resized.astype(np.float32) / 255.0
+
+def get_stretched_res(img: np.ndarray, config: Config) -> tuple:
+    y = len(img)
+    x = len(img[0])
+
+    if (x / float(y)) == config.aspect_ratio:
+        return (y, x)
+
+    if x > y:
+        y = int(x * config.aspect_ratio[1] / config.aspect_ratio[0])
+    else:
+        x = int(y * config.aspect_ratio[0] / config.aspect_ratio[1])
+
+    return (y, x)
 
 def main():
-    config = Config(source_fps=30)
+    config = Config(save_source=True)
 
-    total_frames = extract_frames(config, "./assets/bad_apple.mp4", "./output")
-    print(f"Success! Images extracted, {total_frames} frames processed")
+    frames = extract_frames(config, "./assets/bad_apple.mp4", "./output")
+    print(f"Success! Images extracted, {len(frames)} frames processed")
 
+    found = False
 
 if __name__ == "__main__":
     main()
