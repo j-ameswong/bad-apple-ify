@@ -5,6 +5,7 @@ import tqdm
 import pickle
 from pathlib import Path
 from dataclasses import dataclass
+import subprocess
 
 
 @dataclass
@@ -103,24 +104,46 @@ def mosaic_frame(frame: np.ndarray, gallery: np.ndarray,
 
     return output
 
+def shrink_gallery(gallery: np.ndarray, percentiles: tuple):
+    """Cut off point for lower and upper bound brightnesses"""
+    temp = np.array([cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in gallery])
+    brightnesses = temp.mean(axis=(1,2)) / 255.0
+    low = np.percentile(brightnesses, percentiles[0])
+    high = np.percentile(brightnesses, percentiles[1])
+    mask = (brightnesses >= low) & (brightnesses <= high)
+
+    return gallery[mask]
 
 def main():
     config = Config(input_dir="./assets/rick.mp4",
                     output_dir="./output/",
-                    grid_x=16,
-                    grid_y=12)
+                    grid_x=32,
+                    grid_y=24)
 
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     gallery = get_gallery(input_dir="./assets/gallery/train")
-    bright = gallery_brightness(gallery)
+    gallery_shrunk = shrink_gallery(gallery, (45, 55))
+
+    bright = gallery_brightness(gallery_shrunk)
     frames = extract_video_frames(config)
 
     for f in tqdm.tqdm(range(len(frames)), desc="Building mosaics..."):
-        mosaic = mosaic_frame(frames[f], gallery, bright, config)
+        mosaic = mosaic_frame(frames[f], gallery_shrunk, bright, config)
         cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", mosaic)
 
+    # Run ffmpeg and stitch the generated images together
+    subprocess.run([
+        "ffmpeg", "-framerate", str(config.output_fps),
+        "-i", f"{config.output_dir}/frame_%05d.{config.img_format}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-y", f"{config.output_dir}/output_grid_{config.grid_x}x{config.grid_y}.mp4"
+    ], check=True)
+
+    # Delete now unneeded frames
+    for f in Path(config.output_dir).glob(f"*.{config.img_format}"):
+        f.unlink()
 
 if __name__ == "__main__":
     main()
