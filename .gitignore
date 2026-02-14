@@ -2,3 +2,4 @@ output/*
 .logs
 .venv
 .python-version
+*/gallery/*
