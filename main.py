@@ -37,6 +37,7 @@ class Config:
             raise ValueError(f"{self.aspect_ratio} is not a valid aspect ratio, "
                 " please select from {self.ASPECT_RATIOS}")
 
+
 def get_gallery(input_dir: str) -> np.ndarray:
     """Gets gallery and converts to BGR"""
     with open(Path(f"{input_dir}"), 'rb') as fo:
@@ -60,20 +61,29 @@ def write_gallery(gallery: np.ndarray, config: Config, output_dir: str = "./outp
     print(f"Success! {len(gallery)} gallery images written")
 
 def write_frames(frames: np.ndarray, config: Config):
-    """Stretch to original dimenions and write frames to output dir"""
+    """Stretch to source dimenions and write frames to output dir"""
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     for f in tqdm.tqdm(range(len(frames)),
             desc = f"Writing frames to {output}..."):
 
-        to_write = cv2.resize((frames[f] * 255.0).astype(np.uint8),
-                              (config.src_dimensions[0], config.src_dimensions[1]),
+        to_write = cv2.resize(frames[f], (config.src_dimensions[0], config.src_dimensions[1]),
                               interpolation=cv2.INTER_NEAREST)
 
         cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", to_write)
 
     print(f"Success! Images extracted, {len(frames)} frames processed")
+
+def write_frame_immediately(frame: np.ndarray, frame_num: int, config: Config):
+    """Stretch to source dimenions and write frames to output dir"""
+    output = Path(config.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    to_write = cv2.resize(frame, (config.src_dimensions[0], config.src_dimensions[1]),
+                          interpolation=cv2.INTER_NEAREST)
+
+    cv2.imwrite(f"{output}/frame_{frame_num:05d}.{config.img_format}", to_write)
 
 def extract_video_frames(config: Config) -> np.ndarray:
     """Extract and convert all frames to grayscale"""
@@ -95,14 +105,19 @@ def extract_video_frames(config: Config) -> np.ndarray:
     config.aspect_ratio = config.ASPECT_RATIOS[np.argmin(diffs)]
 
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if num_frames > 99999:
+        raise ValueError("Your video is way too long!")
 
     # initialize output array
     output_data = np.empty((num_frames, config.src_dimensions[1],
-                            config.src_dimensions[0], 3), dtype=np.float32)
+                            config.src_dimensions[0], 3), dtype=np.uint8)
 
     # Extract frames with progress bar
     for f in tqdm.tqdm(range(num_frames), desc="Extracting frames..."):
         ret, frame = cap.read()
+        if not ret:
+            raise RuntimeError("Bad frame!")
+
         output_data[f] = frame
 
     cap.release()
@@ -127,7 +142,7 @@ def find_closest(frame: np.ndarray, gallery: np.ndarray, config) -> int:
 
 def main():
     config = Config(input_dir="./assets/bad_apple.mp4",
-                    output_dir="./output/source/",
+                    output_dir="./output/",
                     batch_size=10)
     gallery = get_gallery(input_dir="./assets/gallery/train")
 
@@ -149,8 +164,11 @@ def main():
         mses = (diffs ** 2).mean(axis=2)
         closest_indices[i:i + config.batch_size] = np.argmin(mses, axis=1)
 
-    print(closest_indices)
-    # write_frames(frames, config)
+        for j, idx in enumerate(closest_indices[i:i + config.batch_size]):
+            write_frame_immediately(gallery[idx], i + j, config)
+
+    result = gallery[closest_indices]
+    write_frames(result, config)
 
 if __name__ == "__main__":
     main()
