@@ -5,6 +5,7 @@ description = "Make bad apple with any video/image collection!"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "matplotlib>=3.10.8",
     "opencv-python>=4.13.0.92",
     "tqdm>=4.67.3",
 ]

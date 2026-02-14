@@ -3,3 +3,5 @@ output/*
 .venv
 .python-version
 */gallery/*
+*.mp4
+*.png

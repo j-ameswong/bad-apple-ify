@@ -1,4 +1,3 @@
-from os import close
 from typing import Literal
 import numpy as np
 import cv2
@@ -7,12 +6,13 @@ import pickle
 from pathlib import Path
 from dataclasses import dataclass
 
+
 @dataclass
 class Config:
     ASPECT_RATIOS = (
-            (4, 3),
-            (16, 9),
-            (16, 10)
+        (4, 3),
+        (16, 9),
+        (16, 10)
     )
 
     input_dir: str
@@ -22,153 +22,105 @@ class Config:
     output_fps: int = 30
     aspect_ratio: tuple = ASPECT_RATIOS[0]
     img_format: Literal["png", "jpg"] = "png"
-    grid_size: int = 16
-    batch_size: int = 100
-
-    # grid here is the new pixelated image vector, higher res by increasing grid_size
-    def grid(self) -> tuple:
-        return tuple(x * self.grid_size for x in self.aspect_ratio)
+    grid_x: int = 64  # tiles across
+    grid_y: int = 48   # tiles down
 
     def src_ratio(self) -> float:
         return self.src_dimensions[0] / float(self.src_dimensions[1])
 
+    def cell_size(self) -> tuple:
+        """Returns (cell_width, cell_height) in pixels."""
+        return (self.src_dimensions[0] // self.grid_x,
+                self.src_dimensions[1] // self.grid_y)
+
     def __post_init__(self):
         if self.aspect_ratio not in self.ASPECT_RATIOS:
             raise ValueError(f"{self.aspect_ratio} is not a valid aspect ratio, "
-                " please select from {self.ASPECT_RATIOS}")
+                             f" please select from {self.ASPECT_RATIOS}")
 
 
 def get_gallery(input_dir: str) -> np.ndarray:
-    """Gets gallery and converts to BGR"""
-    with open(Path(f"{input_dir}"), 'rb') as fo:
+    """Gets CIFAR gallery and converts to BGR."""
+    with open(Path(input_dir), 'rb') as fo:
         data = pickle.load(fo, encoding='latin1')
         images = data['data']
-
-        # reshape and transpose from RGB,Y,X to become YxXxRGB
-        # note for self, transpose = make old pos into new args pos
         temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
         return np.array([cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in temp])
 
-def write_gallery(gallery: np.ndarray, config: Config, output_dir: str = "./output/gallery", img_format: str = "png"):
-    """Write raw CIFAR gallery images"""
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    for i in tqdm.tqdm(range(len(gallery)), desc=f"Writing gallery to {output}..."):
-        img = cv2.resize(gallery[i], config.src_dimensions, interpolation=cv2.INTER_LINEAR)
-        cv2.imwrite(f"{output}/gallery_{i:05d}.{img_format}", img)
-        break
 
-    print(f"Success! {len(gallery)} gallery images written")
+def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
+    """Precompute average brightness (0-1) for each gallery image."""
+    return np.array([cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() / 255.0
+                     for img in gallery])
 
-def write_frames(frames: np.ndarray, config: Config):
-    """Stretch to source dimenions and write frames to output dir"""
-    output = Path(config.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    for f in tqdm.tqdm(range(len(frames)),
-            desc = f"Writing frames to {output}..."):
-
-        to_write = cv2.resize(frames[f], (config.src_dimensions[0], config.src_dimensions[1]),
-                              interpolation=cv2.INTER_NEAREST)
-
-        cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", to_write)
-
-    print(f"Success! Images extracted, {len(frames)} frames processed")
-
-def write_frame_immediately(frame: np.ndarray, frame_num: int, config: Config):
-    """Stretch to source dimenions and write frames to output dir"""
-    output = Path(config.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    to_write = cv2.resize(frame, (config.src_dimensions[0], config.src_dimensions[1]),
-                          interpolation=cv2.INTER_NEAREST)
-
-    cv2.imwrite(f"{output}/frame_{frame_num:05d}.{config.img_format}", to_write)
 
 def extract_video_frames(config: Config) -> np.ndarray:
-    """Extract and convert all frames to grayscale"""
+    """Extract all frames as BGR uint8."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
 
-    # Save frame rate
     config.src_fps = round(cap.get(cv2.CAP_PROP_FPS))
     config.output_fps = config.src_fps
-
-    # Calculate nearest Config.ASPECT_RATIOS
     config.src_dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
-    diffs = [abs(config.src_ratio() - (ratio[0] / float(ratio[1])))
-             for ratio in config.ASPECT_RATIOS] 
-
+    source_ratio = config.src_ratio()
+    diffs = [abs(source_ratio - (r[0] / float(r[1]))) for r in config.ASPECT_RATIOS]
     config.aspect_ratio = config.ASPECT_RATIOS[np.argmin(diffs)]
 
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if num_frames > 99999:
-        raise ValueError("Your video is way too long!")
-
-    # initialize output array
     output_data = np.empty((num_frames, config.src_dimensions[1],
                             config.src_dimensions[0], 3), dtype=np.uint8)
 
-    # Extract frames with progress bar
     for f in tqdm.tqdm(range(num_frames), desc="Extracting frames..."):
         ret, frame = cap.read()
         if not ret:
-            raise RuntimeError("Bad frame!")
-
+            raise RuntimeError(f"Failed to read frame {f}")
         output_data[f] = frame
 
     cap.release()
-    print(f"Success! Images extracted, {num_frames} frames processed")
     return output_data
 
-def fingerprint(img: np.ndarray, grid: tuple) -> np.ndarray:
-    """Returns brightness fingerprint by averaging grid cells"""
 
-    grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(grey, grid, interpolation=cv2.INTER_AREA)
-    return resized.astype(np.float32) / 255.0
+def mosaic_frame(frame: np.ndarray, gallery: np.ndarray,
+                 bright: np.ndarray, config: Config) -> np.ndarray:
+    """Build a mosaic for a single frame by matching each grid cell."""
+    cell_w, cell_h = config.cell_size()
+    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    output = np.empty_like(frame)
 
-def find_closest(frame: np.ndarray, gallery: np.ndarray, config) -> int:
-    """Find closest match from gallery"""
+    for row in range(config.grid_y):
+        for col in range(config.grid_x):
+            y0, y1 = row * cell_h, (row + 1) * cell_h
+            x0, x1 = col * cell_w, (col + 1) * cell_w
 
-    # mean square error
-    diffs = (gallery - frame) ** 2
-    mses = diffs.mean(axis=(1,2))
-    return np.argmin(mses).astype(int)
+            cell_brightness = grey[y0:y1, x0:x1].mean() / 255.0
+            idx = np.argmin((bright - cell_brightness) ** 2)
+
+            tile = cv2.resize(gallery[idx], (cell_w, cell_h))
+            output[y0:y1, x0:x1] = tile
+
+    return output
 
 
 def main():
-    config = Config(input_dir="./assets/bad_apple.mp4",
+    config = Config(input_dir="./assets/rick.mp4",
                     output_dir="./output/",
-                    batch_size=10)
-    gallery = get_gallery(input_dir="./assets/gallery/train")
+                    grid_x=16,
+                    grid_y=12)
 
+    output = Path(config.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    gallery = get_gallery(input_dir="./assets/gallery/train")
+    bright = gallery_brightness(gallery)
     frames = extract_video_frames(config)
 
-    # fingerprint all the images, then calculate mse
-    frames_fp = np.array([fingerprint(img, config.grid()) for img in frames])
-    gallery_fp = np.array([fingerprint(img, config.grid()) for img in gallery])
+    for f in tqdm.tqdm(range(len(frames)), desc="Building mosaics..."):
+        mosaic = mosaic_frame(frames[f], gallery, bright, config)
+        cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", mosaic)
 
-    # pre-flatten once
-    gallery_flat = gallery_fp.reshape(len(gallery_fp), -1)  # (num_gallery, grid_h * grid_w)
-    frames_flat = frames_fp.reshape(len(frames), -1)            # (num_frames, grid_h * grid_w)
-
-    closest_indices = np.empty(len(frames), dtype=np.int32)
-
-    for i in tqdm.tqdm(range(0, len(frames), config.batch_size), desc="Matching frames..."):
-        batch = frames_flat[i:i + config.batch_size]
-        diffs = batch[:, np.newaxis, :] - gallery_flat[np.newaxis, :, :]
-        mses = (diffs ** 2).mean(axis=2)
-        closest_indices[i:i + config.batch_size] = np.argmin(mses, axis=1)
-
-        for j, idx in enumerate(closest_indices[i:i + config.batch_size]):
-            write_frame_immediately(gallery[idx], i + j, config)
-
-    result = gallery[closest_indices]
-    write_frames(result, config)
 
 if __name__ == "__main__":
     main()
