@@ -23,6 +23,7 @@ class Config:
     output_fps: int = 30
     aspect_ratio: tuple = ASPECT_RATIOS[0]
     img_format: Literal["png", "jpg"] = "png"
+    contrast: float = 0.1 # 0 - 1
     grid_x: int = 64  # tiles across
     grid_y: int = 48   # tiles down
 
@@ -104,10 +105,11 @@ def mosaic_frame(frame: np.ndarray, gallery: np.ndarray,
 
     return output
 
-def shrink_gallery(gallery: np.ndarray, percentiles: tuple):
+def shrink_gallery(gallery: np.ndarray, config: Config):
     """Cut off point for lower and upper bound brightnesses"""
+    percentiles = (50 - (50 * config.contrast), 50 + (50 * config.contrast))
     temp = np.array([cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in gallery])
-    brightnesses = temp.mean(axis=(1,2)) / 255.0
+    brightnesses = temp.mean(axis=(1,2)) / 255.0 # normalise
     low = np.percentile(brightnesses, percentiles[0])
     high = np.percentile(brightnesses, percentiles[1])
     mask = (brightnesses >= low) & (brightnesses <= high)
@@ -115,8 +117,9 @@ def shrink_gallery(gallery: np.ndarray, percentiles: tuple):
     return gallery[mask]
 
 def main():
-    config = Config(input_dir="./assets/rick.mp4",
+    config = Config(input_dir="./assets/source.mp4",
                     output_dir="./output/",
+                    contrast=1,
                     grid_x=32,
                     grid_y=24)
 
@@ -124,7 +127,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
 
     gallery = get_gallery(input_dir="./assets/gallery/train")
-    gallery_shrunk = shrink_gallery(gallery, (45, 55))
+    gallery_shrunk = shrink_gallery(gallery, config)
 
     bright = gallery_brightness(gallery_shrunk)
     frames = extract_video_frames(config)
@@ -138,12 +141,23 @@ def main():
         "ffmpeg", "-framerate", str(config.output_fps),
         "-i", f"{config.output_dir}/frame_%05d.{config.img_format}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-y", f"{config.output_dir}/output_grid_{config.grid_x}x{config.grid_y}.mp4"
+        "-y", f"{config.output_dir}/output.mp4"
     ], check=True)
 
     # Delete now unneeded frames
     for f in Path(config.output_dir).glob(f"*.{config.img_format}"):
         f.unlink()
+
+    subprocess.run([
+        "ffmpeg",
+        "-i", config.input_dir,
+        "-i", f"{config.output_dir}/output.mp4",
+        "-filter_complex", "hstack=inputs=2",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-pix_fmt", "yuv420p",
+        "-y", "combined.mp4"
+    ], check=True)
 
 if __name__ == "__main__":
     main()
