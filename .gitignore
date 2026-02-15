@@ -2,6 +2,7 @@ output/*
 .logs
 .venv
 .python-version
-*/gallery/*
-*.mp4
+*/output/
 *.png
+assets/gallery/*.mp4
+!assets/*.mp4

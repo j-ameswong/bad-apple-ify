@@ -20,20 +20,36 @@ class Config:
     output_dir: str
     src_fps: int = 30
     src_dimensions: tuple = (512, 384)
+    target_dimensions: tuple = (512, 384)
     output_fps: int = 30
     aspect_ratio: tuple = ASPECT_RATIOS[0]
     img_format: Literal["png", "jpg"] = "png"
-    contrast: float = 0.1 # 0 - 1
-    grid_x: int = 64  # tiles across
-    grid_y: int = 48   # tiles down
+    contrast: float = 0.1
+    grid_size: int = 16  # multiplier for aspect ratio
+
+    @property
+    def grid_x(self) -> int:
+        return self.aspect_ratio[0] * self.grid_size
+
+    @property
+    def grid_y(self) -> int:
+        return self.aspect_ratio[1] * self.grid_size
 
     def src_ratio(self) -> float:
         return self.src_dimensions[0] / float(self.src_dimensions[1])
 
     def cell_size(self) -> tuple:
-        """Returns (cell_width, cell_height) in pixels."""
-        return (self.src_dimensions[0] // self.grid_x,
-                self.src_dimensions[1] // self.grid_y)
+        return (self.target_dimensions[0] // self.grid_x,
+                self.target_dimensions[1] // self.grid_y)
+
+    def compute_target_dimensions(self):
+        """Snap frame dimensions to nearest multiple of grid."""
+        cell_w = round(self.src_dimensions[0] / self.grid_x)
+        cell_h = round(self.src_dimensions[1] / self.grid_y)
+        # Ensure at least 1px per cell
+        cell_w = max(cell_w, 1)
+        cell_h = max(cell_h, 1)
+        self.target_dimensions = (self.grid_x * cell_w, self.grid_y * cell_h)
 
     def __post_init__(self):
         if self.aspect_ratio not in self.ASPECT_RATIOS:
@@ -46,6 +62,8 @@ def get_gallery(input_dir: str) -> np.ndarray:
     with open(Path(input_dir), 'rb') as fo:
         data = pickle.load(fo, encoding='latin1')
         images = data['data']
+
+        # reminder to self, transpose works by putting in the old positions
         temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
         return np.array([cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in temp])
 
@@ -57,7 +75,6 @@ def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
 
 
 def extract_video_frames(config: Config) -> np.ndarray:
-    """Extract all frames as BGR uint8."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
@@ -70,16 +87,20 @@ def extract_video_frames(config: Config) -> np.ndarray:
     source_ratio = config.src_ratio()
     diffs = [abs(source_ratio - (r[0] / float(r[1]))) for r in config.ASPECT_RATIOS]
     config.aspect_ratio = config.ASPECT_RATIOS[np.argmin(diffs)]
+    config.compute_target_dimensions()
+
+    print(f"Source: {config.src_dimensions}, Target: {config.target_dimensions}, "
+          f"Grid: {config.grid_x}x{config.grid_y}, Cell: {config.cell_size()}")
 
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    output_data = np.empty((num_frames, config.src_dimensions[1],
-                            config.src_dimensions[0], 3), dtype=np.uint8)
+    tw, th = config.target_dimensions
+    output_data = np.empty((num_frames, th, tw, 3), dtype=np.uint8)
 
     for f in tqdm.tqdm(range(num_frames), desc="Extracting frames..."):
         ret, frame = cap.read()
         if not ret:
             raise RuntimeError(f"Failed to read frame {f}")
-        output_data[f] = frame
+        output_data[f] = cv2.resize(frame, config.target_dimensions)
 
     cap.release()
     return output_data
@@ -120,8 +141,7 @@ def main():
     config = Config(input_dir="./assets/source.mp4",
                     output_dir="./output/",
                     contrast=1,
-                    grid_x=32,
-                    grid_y=24)
+                    )
 
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -156,7 +176,7 @@ def main():
         "-c:v", "libx264",
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
-        "-y", "combined.mp4"
+        "-y", f"{config.output_dir}/combined.mp4"
     ], check=True)
 
 if __name__ == "__main__":
