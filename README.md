@@ -45,8 +45,16 @@ The brightness matching is super simple: it's just comparing scalar averages, bu
 
 1. Download dependencies with `uv sync`
 2. Place your source video at `./assets/source.mp4` (or update the path in `main.py`)
-3. Drop the CIFAR-10 train batch into `./assets/gallery/train`
-4. `uv run main.py`
+3. Download the CIFAR-100 train batch into `./assets/gallery/train`:
+
+```
+wget https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
+tar -xzf cifar-100-python.tar.gz
+mv cifar-100-python/train ./assets/gallery/train
+rm -rf cifar-100-python cifar-100-python.tar.gz
+```
+
+5. `uv run main.py`
 
 The script will output the mosaic video and a combined side-by-side version in `./output/`.
 
