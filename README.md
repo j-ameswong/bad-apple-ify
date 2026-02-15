@@ -50,7 +50,7 @@ The brightness matching is super simple: it's just comparing scalar averages, bu
 ```
 wget https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
 tar -xzf cifar-100-python.tar.gz
-mv cifar-100-python/train ./assets/gallery/train
+mv cifar-100-python/train ./assets/gallery/
 rm -rf cifar-100-python cifar-100-python.tar.gz
 ```
 
