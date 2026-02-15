@@ -4,5 +4,5 @@ output/*
 .python-version
 */output/
 *.png
-assets/gallery/*.mp4
+assets/gallery/
 !assets/*.mp4

@@ -56,8 +56,7 @@ All the tweakable parameters live in the `Config` dataclass at the top of `main.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `grid_x` | 32 | Number of tiles across each frame |
-| `grid_y` | 24 | Number of tiles down each frame |
+| `grid_size` | 16 | Multiplier for aspect ratio |
 | `contrast` | 1.0 | Gallery brightness range (0–1). Lower values trim dark/bright extremes |
 | `img_format` | `png` | Format for intermediate frames (`png` or `jpg`) |
 
@@ -68,6 +67,10 @@ Higher grid values = more tiles = finer detail but slower processing. The grid i
 - `opencv-python` — video/image processing
 - `numpy` — all the number crunching
 - `tqdm` — progress bars (essential for sanity)
+
+## Performance
+
+~10 minute processing and stitching for a 512x384 video using 32GB RAM on an i9-13900H with max contrast
 
 ## Limitations
 
