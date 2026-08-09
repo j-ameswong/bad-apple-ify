@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Iterator
 import numpy as np
 import cv2
 import tqdm
@@ -22,8 +22,8 @@ class Config:
     src_dimensions: tuple = (512, 384)
     target_dimensions: tuple = (512, 384)
     output_fps: int = 30
+    src_frame_count: int = 0
     aspect_ratio: tuple = ASPECT_RATIOS[0]
-    img_format: Literal["png", "jpg"] = "png"
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
 
@@ -74,7 +74,8 @@ def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
                      for img in gallery])
 
 
-def extract_video_frames(config: Config) -> np.ndarray:
+def probe_video(config: Config) -> None:
+    """Read source video metadata and derive target dimensions/grid. Mutates config."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
@@ -83,6 +84,9 @@ def extract_video_frames(config: Config) -> np.ndarray:
     config.output_fps = config.src_fps
     config.src_dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                              int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    # Container metadata, used only as a tqdm display hint — may be inaccurate.
+    config.src_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
 
     source_ratio = config.src_ratio()
     diffs = [abs(source_ratio - (r[0] / float(r[1]))) for r in config.ASPECT_RATIOS]
@@ -92,18 +96,20 @@ def extract_video_frames(config: Config) -> np.ndarray:
     print(f"Source: {config.src_dimensions}, Target: {config.target_dimensions}, "
           f"Grid: {config.grid_x}x{config.grid_y}, Cell: {config.cell_size()}")
 
-    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    tw, th = config.target_dimensions
-    output_data = np.empty((num_frames, th, tw, 3), dtype=np.uint8)
 
-    for f in tqdm.tqdm(range(num_frames), desc="Extracting frames..."):
+def stream_frames(config: Config) -> Iterator[np.ndarray]:
+    """Decode and yield source frames one at a time, resized to target dimensions."""
+    cap = cv2.VideoCapture(config.input_dir)
+    if not cap.isOpened():
+        raise ValueError(f"Video at {config.input_dir} not found!")
+
+    while True:
         ret, frame = cap.read()
         if not ret:
-            raise RuntimeError(f"Failed to read frame {f}")
-        output_data[f] = cv2.resize(frame, config.target_dimensions)
+            break
+        yield cv2.resize(frame, config.target_dimensions)
 
     cap.release()
-    return output_data
 
 
 def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple) -> np.ndarray:
@@ -148,30 +154,36 @@ def main():
 
     gallery = get_gallery(input_dir="./assets/gallery/train")
     gallery_shrunk = shrink_gallery(gallery, config)
-
     bright = gallery_brightness(gallery_shrunk)
-    frames = extract_video_frames(config)
+
+    probe_video(config)
     gallery_tiles = resize_gallery_to_cells(gallery_shrunk, config.cell_size())
 
-    for f in tqdm.tqdm(range(len(frames)), desc="Building mosaics..."):
-        mosaic = mosaic_frame(frames[f], gallery_tiles, bright, config)
-        cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", mosaic)
-
-    # Run ffmpeg and stitch the generated images together
-    subprocess.run([
-        "ffmpeg", "-framerate", str(config.output_fps),
-        "-i", f"{config.output_dir}/frame_%05d.{config.img_format}",
+    tw, th = config.target_dimensions
+    output_path = f"{config.output_dir}/output.mp4"
+    proc = subprocess.Popen([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{tw}x{th}", "-framerate", str(config.output_fps),
+        "-i", "-",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-y", f"{config.output_dir}/output.mp4"
-    ], check=True)
+        "-y", output_path
+    ], stdin=subprocess.PIPE)
 
-    # Delete now unneeded frames
-    for f in output.glob(f"*.{config.img_format}"):
-        f.unlink()
+    for frame in tqdm.tqdm(stream_frames(config), desc="Building mosaics...",
+                           total=config.src_frame_count or None):
+        mosaic = mosaic_frame(frame, gallery_tiles, bright, config)
+        proc.stdin.write(mosaic.tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg encode failed with exit code {proc.returncode}")
 
     # Combine source and output side by side
+    print("Combining source and mosaic side by side...")
     subprocess.run([
-        "ffmpeg",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-i", config.input_dir,
         "-i", f"{config.output_dir}/output.mp4",
         "-filter_complex", "hstack=inputs=2",
@@ -179,7 +191,8 @@ def main():
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
         "-y", f"{config.output_dir}/combined.mp4"
-    ], check=True)
+    ], check=True, stdin=subprocess.DEVNULL)
+    print(f"Done. Output written to {config.output_dir}")
 
 if __name__ == "__main__":
     main()
