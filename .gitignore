@@ -6,3 +6,5 @@ output/*
 *.png
 assets/gallery/*
 !assets/*.mp4
+*.mp4
+__pycache__

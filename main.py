@@ -106,25 +106,24 @@ def extract_video_frames(config: Config) -> np.ndarray:
     return output_data
 
 
-def mosaic_frame(frame: np.ndarray, gallery: np.ndarray,
+def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple) -> np.ndarray:
+    """Pre-resize every gallery image to cell size once, ahead of the per-frame loop."""
+    cell_w, cell_h = cell_size
+    return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
+
+
+def mosaic_frame(frame: np.ndarray, gallery_tiles: np.ndarray,
                  bright: np.ndarray, config: Config) -> np.ndarray:
     """Build a mosaic for a single frame by matching each grid cell."""
     cell_w, cell_h = config.cell_size()
+    grid_y, grid_x = config.grid_y, config.grid_x
     grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    output = np.empty_like(frame)
 
-    for row in range(config.grid_y):
-        for col in range(config.grid_x):
-            y0, y1 = row * cell_h, (row + 1) * cell_h
-            x0, x1 = col * cell_w, (col + 1) * cell_w
+    cell_means = grey.reshape(grid_y, cell_h, grid_x, cell_w).mean(axis=(1, 3)) / 255.0
+    idx = np.argmin((cell_means[:, :, None] - bright[None, None, :]) ** 2, axis=-1)
 
-            cell_brightness = grey[y0:y1, x0:x1].mean() / 255.0
-            idx = np.argmin((bright - cell_brightness) ** 2)
-
-            tile = cv2.resize(gallery[idx], (cell_w, cell_h))
-            output[y0:y1, x0:x1] = tile
-
-    return output
+    tiles = gallery_tiles[idx]
+    return tiles.transpose(0, 2, 1, 3, 4).reshape(grid_y * cell_h, grid_x * cell_w, 3)
 
 def shrink_gallery(gallery: np.ndarray, config: Config):
     """Cut off point for lower and upper bound brightnesses"""
@@ -140,7 +139,8 @@ def shrink_gallery(gallery: np.ndarray, config: Config):
 def main():
     config = Config(input_dir="./assets/source.mp4",
                     output_dir="./output/",
-                    contrast=1,
+                    contrast=0.8,
+                    grid_size=8
                     )
 
     output = Path(config.output_dir)
@@ -151,9 +151,10 @@ def main():
 
     bright = gallery_brightness(gallery_shrunk)
     frames = extract_video_frames(config)
+    gallery_tiles = resize_gallery_to_cells(gallery_shrunk, config.cell_size())
 
     for f in tqdm.tqdm(range(len(frames)), desc="Building mosaics..."):
-        mosaic = mosaic_frame(frames[f], gallery_shrunk, bright, config)
+        mosaic = mosaic_frame(frames[f], gallery_tiles, bright, config)
         cv2.imwrite(f"{output}/frame_{f:05d}.{config.img_format}", mosaic)
 
     # Run ffmpeg and stitch the generated images together
@@ -165,9 +166,10 @@ def main():
     ], check=True)
 
     # Delete now unneeded frames
-    for f in Path(config.output_dir).glob(f"*.{config.img_format}"):
+    for f in output.glob(f"*.{config.img_format}"):
         f.unlink()
 
+    # Combine source and output side by side
     subprocess.run([
         "ffmpeg",
         "-i", config.input_dir,
