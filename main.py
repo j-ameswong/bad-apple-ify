@@ -118,17 +118,45 @@ def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple) -> np.ndarray
     return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
 
 
-def mosaic_frame(frame: np.ndarray, gallery_tiles: np.ndarray,
-                 bright: np.ndarray, config: Config) -> np.ndarray:
+class BrightnessMetric:
+    """Match each cell to the gallery image of closest average brightness.
+
+    A cell's brightness rounds to one of 256 levels, so every possible match is
+    resolved once at precompute time into a 256-entry lookup table. Matching is
+    then an O(1) table read per cell rather than an argmin over the gallery, and
+    only the handful of images the table actually names need resizing to tiles.
+    """
+
+    def precompute(self, gallery: np.ndarray, cell_size: tuple) -> None:
+        bright = gallery_brightness(gallery)
+        levels = np.arange(256) / 255.0
+        nearest = np.argmin((levels[:, None] - bright[None, :]) ** 2, axis=-1)
+
+        # Compact the gallery down to the images the LUT can actually reach.
+        used, self._lut = np.unique(nearest, return_inverse=True)
+        self._tiles = resize_gallery_to_cells(gallery[used], cell_size)
+        self._cell_w, self._cell_h = cell_size
+
+    def match(self, frame: np.ndarray) -> np.ndarray:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
+        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        grid_y = grey.shape[0] // self._cell_h
+        grid_x = grey.shape[1] // self._cell_w
+
+        cell_means = grey.reshape(grid_y, self._cell_h,
+                                  grid_x, self._cell_w).mean(axis=(1, 3))
+        return self._lut[np.rint(cell_means).astype(np.uint8)]
+
+    @property
+    def tiles(self) -> np.ndarray:
+        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
+        return self._tiles
+
+
+def mosaic_frame(frame: np.ndarray, metric: BrightnessMetric) -> np.ndarray:
     """Build a mosaic for a single frame by matching each grid cell."""
-    cell_w, cell_h = config.cell_size()
-    grid_y, grid_x = config.grid_y, config.grid_x
-    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    cell_means = grey.reshape(grid_y, cell_h, grid_x, cell_w).mean(axis=(1, 3)) / 255.0
-    idx = np.argmin((cell_means[:, :, None] - bright[None, None, :]) ** 2, axis=-1)
-
-    tiles = gallery_tiles[idx]
+    tiles = metric.tiles[metric.match(frame)]
+    grid_y, grid_x, cell_h, cell_w, _ = tiles.shape
     return tiles.transpose(0, 2, 1, 3, 4).reshape(grid_y * cell_h, grid_x * cell_w, 3)
 
 def shrink_gallery(gallery: np.ndarray, config: Config):
@@ -154,10 +182,11 @@ def main():
 
     gallery = get_gallery(input_dir="./assets/gallery/train")
     gallery_shrunk = shrink_gallery(gallery, config)
-    bright = gallery_brightness(gallery_shrunk)
 
     probe_video(config)
-    gallery_tiles = resize_gallery_to_cells(gallery_shrunk, config.cell_size())
+    metric = BrightnessMetric()
+    metric.precompute(gallery_shrunk, config.cell_size())
+    print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} distinct tiles")
 
     tw, th = config.target_dimensions
     output_path = f"{config.output_dir}/output.mp4"
@@ -172,7 +201,7 @@ def main():
 
     for frame in tqdm.tqdm(stream_frames(config), desc="Building mosaics...",
                            total=config.src_frame_count or None):
-        mosaic = mosaic_frame(frame, gallery_tiles, bright, config)
+        mosaic = mosaic_frame(frame, metric)
         proc.stdin.write(mosaic.tobytes())
 
     proc.stdin.close()
