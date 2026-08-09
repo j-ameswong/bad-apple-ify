@@ -26,6 +26,9 @@ class Config:
     aspect_ratio: tuple = ASPECT_RATIOS[0]
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
+    candidates: int = 256  # tiles to sample from per brightness level
+    epsilon: float = 0.005  # max brightness error (0-1) a candidate may have
+    seed: int = 0
 
     @property
     def grid_x(self) -> int:
@@ -119,22 +122,74 @@ def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple) -> np.ndarray
 
 
 class BrightnessMetric:
-    """Match each cell to the gallery image of closest average brightness.
+    """Match each cell to a gallery image of near-identical average brightness.
 
     A cell's brightness rounds to one of 256 levels, so every possible match is
-    resolved once at precompute time into a 256-entry lookup table. Matching is
-    then an O(1) table read per cell rather than an argmin over the gallery, and
-    only the handful of images the table actually names need resizing to tiles.
+    resolved once at precompute time. Rather than pinning each level to a single
+    best image — which collapses a 40k gallery down to ~100 tiles and makes the
+    mosaic visibly repetitive — precompute gives each level a bucket of the
+    `candidates` images nearest it in brightness, and match() samples one
+    uniformly. Matching stays O(1) per cell and the whole gallery gets used.
+
+    `candidates` is the variety knob and means the same thing whatever the
+    gallery: a fixed brightness radius would over-sample a dense gallery and
+    starve a sparse one. `epsilon` is the accuracy ceiling — no candidate may
+    differ from the level by more than that, so a sparse gallery yields a
+    smaller bucket rather than a tonally wrong one. A level with nothing inside
+    epsilon (including epsilon=0, or candidates=1) falls back to the single
+    nearest image, i.e. the argmin answer.
     """
+
+    def __init__(self, candidates: int = 1, epsilon: float = 0.0, seed: int = 0):
+        self._candidates = candidates
+        self._epsilon = epsilon
+        self._rng = np.random.default_rng(seed)
 
     def precompute(self, gallery: np.ndarray, cell_size: tuple) -> None:
         bright = gallery_brightness(gallery)
+        order = np.argsort(bright)
+        sorted_bright = bright[order]
+        n = len(sorted_bright)
         levels = np.arange(256) / 255.0
-        nearest = np.argmin((levels[:, None] - bright[None, :]) ** 2, axis=-1)
+        k = int(np.clip(self._candidates, 1, n))
 
-        # Compact the gallery down to the images the LUT can actually reach.
-        used, self._lut = np.unique(nearest, return_inverse=True)
-        self._tiles = resize_gallery_to_cells(gallery[used], cell_size)
+        # The k nearest images to a level are contiguous in the sorted gallery,
+        # so a bucket is just an offset and a count.
+        insert = np.searchsorted(sorted_bright, levels)
+        eps_lo = np.searchsorted(sorted_bright, levels - self._epsilon, side="left")
+        eps_hi = np.searchsorted(sorted_bright, levels + self._epsilon, side="right")
+
+        lo = np.empty(256, dtype=np.int64)
+        count = np.empty(256, dtype=np.int64)
+        for i, level in enumerate(levels):
+            # Centre a k-wide window on the level, then slide it onto the true k
+            # nearest — brightness is not uniformly spread, so the midpoint of
+            # the window is not the midpoint of the gallery around it.
+            start = min(max(insert[i] - k // 2, 0), n - k)
+            while start > 0 and level - sorted_bright[start - 1] < sorted_bright[start + k - 1] - level:
+                start -= 1
+            while start + k < n and sorted_bright[start + k] - level < level - sorted_bright[start]:
+                start += 1
+
+            begin, end = max(start, eps_lo[i]), min(start + k, eps_hi[i])
+            if end <= begin:
+                # Nothing within epsilon: take whichever neighbour is closer.
+                left, right = max(insert[i] - 1, 0), min(insert[i], n - 1)
+                begin = (left if abs(level - sorted_bright[left])
+                         <= abs(sorted_bright[right] - level) else right)
+                end = begin + 1
+            lo[i], count[i] = begin, end - begin
+
+        # Compact the gallery down to the images some bucket can actually reach.
+        spans = np.zeros(n + 1, dtype=np.int64)
+        np.add.at(spans, lo, 1)
+        np.add.at(spans, lo + count, -1)
+        reachable = np.flatnonzero(np.cumsum(spans)[:n] > 0)
+        self._remap = np.zeros(n, dtype=np.int64)
+        self._remap[reachable] = np.arange(len(reachable))
+
+        self._lo, self._count = lo, count
+        self._tiles = resize_gallery_to_cells(gallery[order[reachable]], cell_size)
         self._cell_w, self._cell_h = cell_size
 
     def match(self, frame: np.ndarray) -> np.ndarray:
@@ -145,7 +200,17 @@ class BrightnessMetric:
 
         cell_means = grey.reshape(grid_y, self._cell_h,
                                   grid_x, self._cell_w).mean(axis=(1, 3))
-        return self._lut[np.rint(cell_means).astype(np.uint8)]
+        levels = np.rint(cell_means).astype(np.uint8)
+
+        lo = self._lo[levels]
+        picks = lo + self._rng.integers(self._count[levels])
+        return self._remap[picks]
+
+    @property
+    def bucket_size(self) -> float:
+        """Median candidates per level, ignoring levels outside the gallery's range."""
+        real = self._count[self._count > 1]
+        return float(np.median(real)) if len(real) else 1.0
 
     @property
     def tiles(self) -> np.ndarray:
@@ -184,9 +249,11 @@ def main():
     gallery_shrunk = shrink_gallery(gallery, config)
 
     probe_video(config)
-    metric = BrightnessMetric()
+    metric = BrightnessMetric(candidates=config.candidates,
+                              epsilon=config.epsilon, seed=config.seed)
     metric.precompute(gallery_shrunk, config.cell_size())
-    print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} distinct tiles")
+    print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} usable tiles, "
+          f"{metric.bucket_size:.0f} candidates per cell (median)")
 
     tw, th = config.target_dimensions
     output_path = f"{config.output_dir}/output.mp4"
