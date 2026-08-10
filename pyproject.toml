@@ -9,6 +9,16 @@ dependencies = [
     "tqdm>=4.67.3",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# main.py lives at the repo root, not in a package.
+pythonpath = ["."]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
