@@ -3,19 +3,18 @@ import numpy as np
 import cv2
 import tqdm
 import pickle
+import warnings
+from fractions import Fraction
 from pathlib import Path
 from dataclasses import dataclass
 import subprocess
 
+# Rec.601 luma weights in BGR order — what cv2.COLOR_BGR2GRAY applies.
+LUMA_BGR = np.array([0.114, 0.587, 0.299])
+
 
 @dataclass
 class Config:
-    ASPECT_RATIOS = (
-        (4, 3),
-        (16, 9),
-        (16, 10)
-    )
-
     input_dir: str
     output_dir: str
     src_fps: int = 30
@@ -23,7 +22,10 @@ class Config:
     target_dimensions: tuple = (512, 384)
     output_fps: int = 30
     src_frame_count: int = 0
-    aspect_ratio: tuple = ASPECT_RATIOS[0]
+    # Smallest integer pair approximating the source's aspect ratio; derived in
+    # probe_video(). The grid only needs *some* integer pair, so any source
+    # keeps its own shape instead of being snapped to an allowlisted ratio.
+    aspect_ratio: tuple = (4, 3)
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
     candidates: int = 256  # tiles to sample from per brightness level
@@ -38,9 +40,6 @@ class Config:
     def grid_y(self) -> int:
         return self.aspect_ratio[1] * self.grid_size
 
-    def src_ratio(self) -> float:
-        return self.src_dimensions[0] / float(self.src_dimensions[1])
-
     def cell_size(self) -> tuple:
         return (self.target_dimensions[0] // self.grid_x,
                 self.target_dimensions[1] // self.grid_y)
@@ -54,27 +53,31 @@ class Config:
         cell_h = max(cell_h, 1)
         self.target_dimensions = (self.grid_x * cell_w, self.grid_y * cell_h)
 
-    def __post_init__(self):
-        if self.aspect_ratio not in self.ASPECT_RATIOS:
-            raise ValueError(f"{self.aspect_ratio} is not a valid aspect ratio, "
-                             f" please select from {self.ASPECT_RATIOS}")
-
 
 def get_gallery(input_dir: str) -> np.ndarray:
     """Gets CIFAR gallery and converts to BGR."""
     with open(Path(input_dir), 'rb') as fo:
-        data = pickle.load(fo, encoding='latin1')
+        with warnings.catch_warnings():
+            # The CIFAR pickle carries a dtype pickled by an ancient NumPy with
+            # `align=0`; NumPy 2.4 deprecates the int form. Nothing we can fix
+            # from this side short of re-serialising the file.
+            warnings.filterwarnings("ignore", message=".*align=0.*")
+            data = pickle.load(fo, encoding='latin1')
         images = data['data']
 
         # reminder to self, transpose works by putting in the old positions
         temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
-        return np.array([cv2.cvtColor(img, cv2.COLOR_RGB2BGR) for img in temp])
+        # Contiguous because cv2 will not take a reverse-strided view later.
+        return np.ascontiguousarray(temp[..., ::-1])  # RGB -> BGR
 
 
 def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
-    """Precompute average brightness (0-1) for each gallery image."""
-    return np.array([cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean() / 255.0
-                     for img in gallery])
+    """Average brightness (0-1) for each gallery image.
+
+    Luma is linear, so the mean of the luma equals the luma of the channel
+    means — one (N, 3) reduction instead of a per-image cvtColor.
+    """
+    return gallery.mean(axis=(1, 2)) @ LUMA_BGR / 255.0
 
 
 def probe_video(config: Config) -> None:
@@ -91,9 +94,13 @@ def probe_video(config: Config) -> None:
     config.src_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    source_ratio = config.src_ratio()
-    diffs = [abs(source_ratio - (r[0] / float(r[1]))) for r in config.ASPECT_RATIOS]
-    config.aspect_ratio = config.ASPECT_RATIOS[np.argmin(diffs)]
+    # Any integer pair close to the source ratio will do, so take the simplest
+    # one rather than snapping to a fixed list — a 2.39:1 source should stay
+    # 2.39:1, not get stretched to 16:9. Capping the denominator keeps the pair
+    # small: an exact reduction of e.g. 2048x858 is 1024:429, which is useless
+    # as a grid multiplier.
+    ratio = Fraction(*config.src_dimensions).limit_denominator(16)
+    config.aspect_ratio = (ratio.numerator, ratio.denominator)
     config.compute_target_dimensions()
 
     print(f"Source: {config.src_dimensions}, Target: {config.target_dimensions}, "
@@ -145,8 +152,9 @@ class BrightnessMetric:
         self._epsilon = epsilon
         self._rng = np.random.default_rng(seed)
 
-    def precompute(self, gallery: np.ndarray, cell_size: tuple) -> None:
-        bright = gallery_brightness(gallery)
+    def precompute(self, gallery: np.ndarray, cell_size: tuple,
+                   brightness: np.ndarray | None = None) -> None:
+        bright = gallery_brightness(gallery) if brightness is None else brightness
         order = np.argsort(bright)
         sorted_bright = bright[order]
         n = len(sorted_bright)
@@ -224,21 +232,24 @@ def mosaic_frame(frame: np.ndarray, metric: BrightnessMetric) -> np.ndarray:
     grid_y, grid_x, cell_h, cell_w, _ = tiles.shape
     return tiles.transpose(0, 2, 1, 3, 4).reshape(grid_y * cell_h, grid_x * cell_w, 3)
 
-def shrink_gallery(gallery: np.ndarray, config: Config):
-    """Cut off point for lower and upper bound brightnesses"""
-    percentiles = (50 - (50 * config.contrast), 50 + (50 * config.contrast))
-    temp = np.array([cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) for img in gallery])
-    brightnesses = temp.mean(axis=(1,2)) / 255.0 # normalise
-    low = np.percentile(brightnesses, percentiles[0])
-    high = np.percentile(brightnesses, percentiles[1])
-    mask = (brightnesses >= low) & (brightnesses <= high)
+def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
+                   config: Config) -> tuple[np.ndarray, np.ndarray]:
+    """Trim the gallery to a percentile band of brightness around the midpoint.
 
-    return gallery[mask]
+    Takes the brightnesses rather than recomputing them, and returns the
+    surviving ones alongside the images so the caller never needs a second pass.
+    """
+    percentiles = (50 - (50 * config.contrast), 50 + (50 * config.contrast))
+    low = np.percentile(brightness, percentiles[0])
+    high = np.percentile(brightness, percentiles[1])
+    mask = (brightness >= low) & (brightness <= high)
+
+    return gallery[mask], brightness[mask]
 
 def main():
     config = Config(input_dir="./assets/source.mp4",
                     output_dir="./output/",
-                    contrast=0.8,
+                    contrast=1.0,
                     grid_size=8
                     )
 
@@ -246,12 +257,13 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
 
     gallery = get_gallery(input_dir="./assets/gallery/train")
-    gallery_shrunk = shrink_gallery(gallery, config)
+    brightness = gallery_brightness(gallery)
+    gallery_shrunk, brightness_shrunk = shrink_gallery(gallery, brightness, config)
 
     probe_video(config)
     metric = BrightnessMetric(candidates=config.candidates,
                               epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(gallery_shrunk, config.cell_size())
+    metric.precompute(gallery_shrunk, config.cell_size(), brightness_shrunk)
     print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} usable tiles, "
           f"{metric.bucket_size:.0f} candidates per cell (median)")
 
@@ -278,11 +290,14 @@ def main():
 
     # Combine source and output side by side
     print("Combining source and mosaic side by side...")
+    # hstack requires both inputs to be the same height, and the mosaic is only
+    # incidentally the source's size — compute_target_dimensions() snaps to a
+    # grid multiple. Scale the source to match rather than relying on that.
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-i", config.input_dir,
         "-i", f"{config.output_dir}/output.mp4",
-        "-filter_complex", "hstack=inputs=2",
+        "-filter_complex", f"[0:v]scale={tw}:{th},setsar=1[src];[src][1:v]hstack=inputs=2",
         "-c:v", "libx264",
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
