@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from main import Config, get_gallery, gallery_brightness, shrink_gallery
+from main import UserConfig, get_gallery, gallery_brightness, shrink_gallery
 
 
 def test_get_gallery_shape_and_channel_order(cifar_pickle):
@@ -35,7 +35,7 @@ def test_gallery_brightness_range(gallery):
 
 def test_shrink_gallery_keeps_middle_band(gallery):
     brightness = gallery_brightness(gallery)
-    config = Config(input_dir="", output_dir="", contrast=0.5)
+    config = UserConfig(input_dir="", output_dir="", contrast=0.5)
 
     kept, kept_brightness = shrink_gallery(gallery, brightness, config)
 
@@ -49,7 +49,7 @@ def test_shrink_gallery_keeps_middle_band(gallery):
 
 def test_shrink_gallery_full_contrast_keeps_everything(gallery):
     brightness = gallery_brightness(gallery)
-    config = Config(input_dir="", output_dir="", contrast=1.0)
+    config = UserConfig(input_dir="", output_dir="", contrast=1.0)
 
     kept, kept_brightness = shrink_gallery(gallery, brightness, config)
 
@@ -60,7 +60,7 @@ def test_shrink_gallery_full_contrast_keeps_everything(gallery):
 def test_shrink_gallery_returns_matching_brightnesses(gallery):
     """The returned brightnesses must be the survivors' own, not a stale slice."""
     brightness = gallery_brightness(gallery)
-    config = Config(input_dir="", output_dir="", contrast=0.3)
+    config = UserConfig(input_dir="", output_dir="", contrast=0.3)
 
     kept, kept_brightness = shrink_gallery(gallery, brightness, config)
 

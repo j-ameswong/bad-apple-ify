@@ -13,45 +13,73 @@ import subprocess
 LUMA_BGR = np.array([0.114, 0.587, 0.299])
 
 
-@dataclass
-class Config:
+@dataclass(frozen=True)
+class UserConfig:
+    """Parameters the user supplies. Nothing here depends on the source video."""
+
     input_dir: str
     output_dir: str
-    src_fps: int = 30
-    src_dimensions: tuple = (512, 384)
-    target_dimensions: tuple = (512, 384)
-    output_fps: int = 30
-    src_frame_count: int = 0
-    # Smallest integer pair approximating the source's aspect ratio; derived in
-    # probe_video(). The grid only needs *some* integer pair, so any source
-    # keeps its own shape instead of being snapped to an allowlisted ratio.
-    aspect_ratio: tuple = (4, 3)
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
     candidates: int = 256  # tiles to sample from per brightness level
     epsilon: float = 0.005  # max brightness error (0-1) a candidate may have
     seed: int = 0
 
+
+@dataclass(frozen=True)
+class DerivedConfig:
+    """Everything computed from a `UserConfig` once the source has been probed.
+
+    Built once by `probe_video()` and never mutated afterwards, so the grid and
+    the frame size a run was set up with cannot drift apart mid-pipeline.
+    """
+
+    src_fps: int
+    src_dimensions: tuple[int, int]
+    src_frame_count: int
+    # Smallest integer pair approximating the source's aspect ratio. The grid
+    # only needs *some* integer pair, so any source keeps its own shape instead
+    # of being snapped to an allowlisted ratio.
+    aspect_ratio: tuple[int, int]
+    grid: tuple[int, int]
+    cell_size: tuple[int, int]
+
+    @classmethod
+    def from_source(cls, config: UserConfig, *, fps: int,
+                    dimensions: tuple[int, int], frame_count: int) -> "DerivedConfig":
+        # Any integer pair close to the source ratio will do, so take the
+        # simplest one rather than snapping to a fixed list — a 2.39:1 source
+        # should stay 2.39:1, not get stretched to 16:9. Capping the denominator
+        # keeps the pair small: an exact reduction of e.g. 2048x858 is 1024:429,
+        # which is useless as a grid multiplier.
+        ratio = Fraction(*dimensions).limit_denominator(16)
+        aspect_ratio = (ratio.numerator, ratio.denominator)
+        grid = (aspect_ratio[0] * config.grid_size,
+                aspect_ratio[1] * config.grid_size)
+        # Snap the frame to the nearest whole multiple of the grid, at least
+        # 1px per cell however fine the grid is.
+        cell_size = (max(round(dimensions[0] / grid[0]), 1),
+                     max(round(dimensions[1] / grid[1]), 1))
+        return cls(src_fps=fps, src_dimensions=dimensions,
+                   src_frame_count=frame_count, aspect_ratio=aspect_ratio,
+                   grid=grid, cell_size=cell_size)
+
     @property
     def grid_x(self) -> int:
-        return self.aspect_ratio[0] * self.grid_size
+        return self.grid[0]
 
     @property
     def grid_y(self) -> int:
-        return self.aspect_ratio[1] * self.grid_size
+        return self.grid[1]
 
-    def cell_size(self) -> tuple:
-        return (self.target_dimensions[0] // self.grid_x,
-                self.target_dimensions[1] // self.grid_y)
+    @property
+    def output_fps(self) -> int:
+        return self.src_fps
 
-    def compute_target_dimensions(self):
-        """Snap frame dimensions to nearest multiple of grid."""
-        cell_w = round(self.src_dimensions[0] / self.grid_x)
-        cell_h = round(self.src_dimensions[1] / self.grid_y)
-        # Ensure at least 1px per cell
-        cell_w = max(cell_w, 1)
-        cell_h = max(cell_h, 1)
-        self.target_dimensions = (self.grid_x * cell_w, self.grid_y * cell_h)
+    @property
+    def target_dimensions(self) -> tuple[int, int]:
+        return (self.grid[0] * self.cell_size[0],
+                self.grid[1] * self.cell_size[1])
 
 
 def get_gallery(input_dir: str) -> np.ndarray:
@@ -80,34 +108,28 @@ def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
     return gallery.mean(axis=(1, 2)) @ LUMA_BGR / 255.0
 
 
-def probe_video(config: Config) -> None:
-    """Read source video metadata and derive target dimensions/grid. Mutates config."""
+def probe_video(config: UserConfig) -> DerivedConfig:
+    """Read source video metadata and derive the grid, cell and target size."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
 
-    config.src_fps = round(cap.get(cv2.CAP_PROP_FPS))
-    config.output_fps = config.src_fps
-    config.src_dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    fps = round(cap.get(cv2.CAP_PROP_FPS))
+    dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                  int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     # Container metadata, used only as a tqdm display hint — may be inaccurate.
-    config.src_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    # Any integer pair close to the source ratio will do, so take the simplest
-    # one rather than snapping to a fixed list — a 2.39:1 source should stay
-    # 2.39:1, not get stretched to 16:9. Capping the denominator keeps the pair
-    # small: an exact reduction of e.g. 2048x858 is 1024:429, which is useless
-    # as a grid multiplier.
-    ratio = Fraction(*config.src_dimensions).limit_denominator(16)
-    config.aspect_ratio = (ratio.numerator, ratio.denominator)
-    config.compute_target_dimensions()
+    derived = DerivedConfig.from_source(config, fps=fps, dimensions=dimensions,
+                                        frame_count=frame_count)
 
-    print(f"Source: {config.src_dimensions}, Target: {config.target_dimensions}, "
-          f"Grid: {config.grid_x}x{config.grid_y}, Cell: {config.cell_size()}")
+    print(f"Source: {derived.src_dimensions}, Target: {derived.target_dimensions}, "
+          f"Grid: {derived.grid_x}x{derived.grid_y}, Cell: {derived.cell_size}")
+    return derived
 
 
-def stream_frames(config: Config) -> Iterator[np.ndarray]:
+def stream_frames(config: UserConfig, derived: DerivedConfig) -> Iterator[np.ndarray]:
     """Decode and yield source frames one at a time, resized to target dimensions."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
@@ -117,7 +139,7 @@ def stream_frames(config: Config) -> Iterator[np.ndarray]:
         ret, frame = cap.read()
         if not ret:
             break
-        yield cv2.resize(frame, config.target_dimensions)
+        yield cv2.resize(frame, derived.target_dimensions)
 
     cap.release()
 
@@ -152,7 +174,7 @@ class BrightnessMetric:
         self._epsilon = epsilon
         self._rng = np.random.default_rng(seed)
 
-    def precompute(self, gallery: np.ndarray, cell_size: tuple,
+    def precompute(self, gallery: np.ndarray, cell_size: tuple[int, int],
                    brightness: np.ndarray | None = None) -> None:
         bright = gallery_brightness(gallery) if brightness is None else brightness
         order = np.argsort(bright)
@@ -233,7 +255,7 @@ def mosaic_frame(frame: np.ndarray, metric: BrightnessMetric) -> np.ndarray:
     return tiles.transpose(0, 2, 1, 3, 4).reshape(grid_y * cell_h, grid_x * cell_w, 3)
 
 def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
-                   config: Config) -> tuple[np.ndarray, np.ndarray]:
+                   config: UserConfig) -> tuple[np.ndarray, np.ndarray]:
     """Trim the gallery to a percentile band of brightness around the midpoint.
 
     Takes the brightnesses rather than recomputing them, and returns the
@@ -247,11 +269,11 @@ def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
     return gallery[mask], brightness[mask]
 
 def main():
-    config = Config(input_dir="./assets/source.mp4",
-                    output_dir="./output/",
-                    contrast=1.0,
-                    grid_size=8
-                    )
+    config = UserConfig(input_dir="./assets/source.mp4",
+                        output_dir="./output/",
+                        contrast=1.0,
+                        grid_size=8
+                        )
 
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -260,26 +282,26 @@ def main():
     brightness = gallery_brightness(gallery)
     gallery_shrunk, brightness_shrunk = shrink_gallery(gallery, brightness, config)
 
-    probe_video(config)
+    derived = probe_video(config)
     metric = BrightnessMetric(candidates=config.candidates,
                               epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(gallery_shrunk, config.cell_size(), brightness_shrunk)
+    metric.precompute(gallery_shrunk, derived.cell_size, brightness_shrunk)
     print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} usable tiles, "
           f"{metric.bucket_size:.0f} candidates per cell (median)")
 
-    tw, th = config.target_dimensions
+    tw, th = derived.target_dimensions
     output_path = f"{config.output_dir}/output.mp4"
     proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{tw}x{th}", "-framerate", str(config.output_fps),
+        "-s", f"{tw}x{th}", "-framerate", str(derived.output_fps),
         "-i", "-",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-y", output_path
     ], stdin=subprocess.PIPE)
 
-    for frame in tqdm.tqdm(stream_frames(config), desc="Building mosaics...",
-                           total=config.src_frame_count or None):
+    for frame in tqdm.tqdm(stream_frames(config, derived), desc="Building mosaics...",
+                           total=derived.src_frame_count or None):
         mosaic = mosaic_frame(frame, metric)
         proc.stdin.write(mosaic.tobytes())
 

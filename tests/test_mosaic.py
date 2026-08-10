@@ -1,6 +1,6 @@
 import numpy as np
 
-from main import (BrightnessMetric, Config, gallery_brightness, mosaic_frame,
+from main import (BrightnessMetric, UserConfig, gallery_brightness, mosaic_frame,
                   probe_video, stream_frames)
 
 CELL = (4, 4)
@@ -74,16 +74,17 @@ def test_mosaic_tracks_frame_brightness(gallery):
 def test_pipeline_over_a_video(video, gallery):
     """Every source frame yields one mosaic at the configured target size."""
     path, frames = video
-    config = Config(input_dir=str(path), output_dir="", grid_size=2,
-                    candidates=8, epsilon=0.1)
-    probe_video(config)
+    config = UserConfig(input_dir=str(path), output_dir="", grid_size=2,
+                        candidates=8, epsilon=0.1)
+    derived = probe_video(config)
 
     metric = BrightnessMetric(candidates=config.candidates,
                               epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(gallery, config.cell_size(), gallery_brightness(gallery))
+    metric.precompute(gallery, derived.cell_size, gallery_brightness(gallery))
 
-    mosaics = [mosaic_frame(frame, metric) for frame in stream_frames(config)]
+    mosaics = [mosaic_frame(frame, metric)
+               for frame in stream_frames(config, derived)]
 
     assert len(mosaics) == len(frames)
     for mosaic in mosaics:
-        assert mosaic.shape[1::-1] == config.target_dimensions
+        assert mosaic.shape[1::-1] == derived.target_dimensions
