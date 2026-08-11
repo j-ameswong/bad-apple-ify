@@ -2,6 +2,8 @@ from typing import Iterator, Protocol
 import numpy as np
 import cv2
 import tqdm
+import hashlib
+import os
 import pickle
 import warnings
 from fractions import Fraction
@@ -95,6 +97,17 @@ class GallerySource(Protocol):
     size derived before any gallery can be loaded.
     """
 
+    @property
+    def fingerprint(self) -> str:
+        """Identifies what `load()` will return, ignoring cell size.
+
+        Everything that changes the tiles — the file(s) read, their mtimes, and
+        any sampling parameters — and nothing that doesn't. `load_gallery()`
+        keys its cache on this, so a source that under-reports here will serve
+        stale tiles.
+        """
+        ...
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         """(N, cell_h, cell_w, 3) BGR tiles at the given (width, height) cell size."""
         ...
@@ -129,6 +142,10 @@ class CifarGallery:
     def __init__(self, path: Path):
         self._path = Path(path)
 
+    @property
+    def fingerprint(self) -> str:
+        return f"cifar:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size)
 
@@ -141,8 +158,65 @@ class VideoGallery:
         self._path = Path(path)
         self._stride = stride
 
+    @property
+    def fingerprint(self) -> str:
+        return (f"video:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
+                f":stride={self._stride}")
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         raise NotImplementedError("VideoGallery lands in phase 2.1")
+
+
+DEFAULT_CACHE_DIR = Path(".cache/gallery")
+
+
+def cache_key(source: GallerySource, cell_size: tuple[int, int]) -> str:
+    """Filename-safe digest of everything that determines the loaded tiles.
+
+    Left as a plain string rather than a structured name so a metric's own
+    precompute could join the key later without changing the layout — though
+    for `BrightnessMetric` that would be caching a 10 ms computation behind a
+    38 MB read, so only the tiles are cached today.
+    """
+    material = f"{source.fingerprint}|cell={cell_size[0]}x{cell_size[1]}"
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def load_gallery(source: GallerySource, derived: DerivedConfig, *,
+                 cache_dir: Path = DEFAULT_CACHE_DIR,
+                 use_cache: bool = True) -> np.ndarray:
+    """Load tiles at the derived cell size, going through the on-disk cache.
+
+    A gallery load costs one decode pass over the whole source — ~12 minutes
+    for a season of anime — which is unusable to sit through on every run, and
+    the result is small enough to keep (41k tiles at 16x16 is 32 MB).
+    """
+    cell_size = derived.cell_size
+    if not use_cache:
+        return source.load(cell_size)
+
+    path = cache_dir / f"tiles-{cache_key(source, cell_size)}.npy"
+    if path.exists():
+        tiles = np.load(path)
+        # A truncated or hand-edited cache file is not worth trusting over a
+        # re-decode; the key already guarantees the tiles are otherwise current.
+        if tiles.shape[1:] == (cell_size[1], cell_size[0], 3):
+            print(f"Gallery cache hit: {path}")
+            return tiles
+        print(f"Gallery cache at {path} is malformed, reloading")
+
+    tiles = source.load(cell_size)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Write-then-rename, so a run killed mid-write leaves the old cache intact
+    # rather than a half-file the next run would have to detect.
+    # Keeps the .npy extension, which np.save would otherwise append itself.
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp.npy")
+    try:
+        np.save(temp, tiles, allow_pickle=False)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return tiles
 
 
 def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
@@ -330,7 +404,7 @@ def main(gallery_source: GallerySource):
     # because tiles are only ever stored at cell resolution.
     derived = probe_video(config)
 
-    gallery = gallery_source.load(derived.cell_size)
+    gallery = load_gallery(gallery_source, derived)
     brightness = gallery_brightness(gallery)
     gallery_shrunk, brightness_shrunk = shrink_gallery(gallery, brightness, config)
 
