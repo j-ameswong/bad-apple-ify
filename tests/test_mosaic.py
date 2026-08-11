@@ -1,9 +1,8 @@
 import numpy as np
 
-from main import (BrightnessMetric, UserConfig, gallery_brightness, mosaic_frame,
-                  probe_video, stream_frames)
-
-CELL = (4, 4)
+from conftest import CELL
+from main import (BrightnessMetric, CifarGallery, UserConfig, gallery_brightness,
+                  mosaic_frame, probe_video, stream_frames)
 
 
 def assemble_by_loop(tiles: np.ndarray, indices: np.ndarray) -> np.ndarray:
@@ -18,10 +17,10 @@ def assemble_by_loop(tiles: np.ndarray, indices: np.ndarray) -> np.ndarray:
     return out
 
 
-def test_vectorised_assembly_is_byte_identical(gallery):
+def test_vectorised_assembly_is_byte_identical(cell_gallery):
     """0.1: fancy indexing + transpose must equal the nested-loop placement."""
     metric = BrightnessMetric(candidates=8, epsilon=0.1, seed=0)
-    metric.precompute(gallery, CELL, gallery_brightness(gallery))
+    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
 
     rng = np.random.default_rng(2)
     frame = rng.integers(0, 256, (CELL[1] * 6, CELL[0] * 9, 3), dtype=np.uint8)
@@ -34,9 +33,9 @@ def test_vectorised_assembly_is_byte_identical(gallery):
     np.testing.assert_array_equal(fast, assemble_by_loop(metric.tiles, indices))
 
 
-def test_mosaic_frame_preserves_frame_size(gallery):
+def test_mosaic_frame_preserves_frame_size(cell_gallery):
     metric = BrightnessMetric(candidates=4, epsilon=0.1, seed=0)
-    metric.precompute(gallery, CELL, gallery_brightness(gallery))
+    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
     frame = np.full((CELL[1] * 5, CELL[0] * 7, 3), 90, dtype=np.uint8)
 
     mosaic = mosaic_frame(frame, metric)
@@ -45,10 +44,10 @@ def test_mosaic_frame_preserves_frame_size(gallery):
     assert mosaic.dtype == np.uint8
 
 
-def test_every_block_of_the_mosaic_is_a_gallery_tile(gallery):
+def test_every_block_of_the_mosaic_is_a_gallery_tile(cell_gallery):
     """No blending or interpolation: each cell is one image, placed whole."""
     metric = BrightnessMetric(candidates=4, epsilon=0.1, seed=0)
-    metric.precompute(gallery, CELL, gallery_brightness(gallery))
+    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
     rng = np.random.default_rng(3)
     frame = rng.integers(0, 256, (CELL[1] * 4, CELL[0] * 4, 3), dtype=np.uint8)
 
@@ -59,10 +58,10 @@ def test_every_block_of_the_mosaic_is_a_gallery_tile(gallery):
         assert any(np.array_equal(block, tile) for tile in metric.tiles)
 
 
-def test_mosaic_tracks_frame_brightness(gallery):
+def test_mosaic_tracks_frame_brightness(cell_gallery):
     """A brighter frame must produce a brighter mosaic."""
     metric = BrightnessMetric(candidates=4, epsilon=0.05, seed=0)
-    metric.precompute(gallery, CELL, gallery_brightness(gallery))
+    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
     shape = (CELL[1] * 4, CELL[0] * 4, 3)
 
     dark = mosaic_frame(np.full(shape, 40, dtype=np.uint8), metric)
@@ -71,16 +70,21 @@ def test_mosaic_tracks_frame_brightness(gallery):
     assert dark.mean() < light.mean()
 
 
-def test_pipeline_over_a_video(video, gallery):
-    """Every source frame yields one mosaic at the configured target size."""
+def test_pipeline_over_a_video(video, cifar_pickle):
+    """Every source frame yields one mosaic at the configured target size.
+
+    Runs in the 1.2 order: probe the source, then load the gallery at the cell
+    size that probe derived.
+    """
     path, frames = video
     config = UserConfig(input_dir=str(path), output_dir="", grid_size=2,
                         candidates=8, epsilon=0.1)
     derived = probe_video(config)
 
+    tiles = CifarGallery(cifar_pickle[0]).load(derived.cell_size)
     metric = BrightnessMetric(candidates=config.candidates,
                               epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(gallery, derived.cell_size, gallery_brightness(gallery))
+    metric.precompute(tiles, derived.cell_size, gallery_brightness(tiles))
 
     mosaics = [mosaic_frame(frame, metric)
                for frame in stream_frames(config, derived)]

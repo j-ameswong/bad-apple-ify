@@ -11,10 +11,15 @@ import cv2
 import numpy as np
 import pytest
 
+from main import resize_gallery_to_cells
+
 # Lossless, so a written fixture video decodes back to exactly the frames that
 # went in and tests can assert on pixels rather than tolerances.
 FOURCC = cv2.VideoWriter_fourcc(*"FFV1")
 VIDEO_SUFFIX = ".mkv"
+
+# The (width, height) cell the tile-level tests work at.
+CELL = (4, 4)
 
 
 def make_frames(count: int, width: int, height: int, seed: int = 0) -> np.ndarray:
@@ -93,6 +98,16 @@ def gallery() -> np.ndarray:
     texture -= texture.mean(axis=(1, 2, 3), keepdims=True)
     imgs = base[:, None, None, None] + texture
     return np.clip(np.rint(imgs), 0, 255).astype(np.uint8)
+
+
+@pytest.fixture
+def cell_gallery(gallery) -> np.ndarray:
+    """The gallery as a `GallerySource` hands it over: already at cell size.
+
+    Everything downstream of the load — brightness, matching, mosaicking — only
+    ever sees tiles at this resolution, so that is what the fixtures feed it.
+    """
+    return resize_gallery_to_cells(gallery, CELL)
 
 
 @pytest.fixture

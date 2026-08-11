@@ -1,4 +1,4 @@
-from typing import Iterator
+from typing import Iterator, Protocol
 import numpy as np
 import cv2
 import tqdm
@@ -82,9 +82,33 @@ class DerivedConfig:
                 self.grid[1] * self.cell_size[1])
 
 
-def get_gallery(input_dir: str) -> np.ndarray:
-    """Gets CIFAR gallery and converts to BGR."""
-    with open(Path(input_dir), 'rb') as fo:
+class GallerySource(Protocol):
+    """A source of tiles, handed over already at cell size.
+
+    `load()` taking the cell size is the whole point of the protocol, not a
+    convenience: a video gallery is only tractable because frames are
+    downscaled *during* decode. 41k frames at 1080p is 257 GB, the same frames
+    at 16x16 are 32 MB. A source that promised full-resolution images could not
+    be implemented for video at all, so the protocol never promises them.
+
+    The cost is a load-order constraint: the source must be probed and the cell
+    size derived before any gallery can be loaded.
+    """
+
+    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+        """(N, cell_h, cell_w, 3) BGR tiles at the given (width, height) cell size."""
+        ...
+
+
+def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple[int, int]) -> np.ndarray:
+    """Resize every gallery image to cell size once, at load time."""
+    cell_w, cell_h = cell_size
+    return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
+
+
+def read_cifar_batch(path: Path) -> np.ndarray:
+    """Read a CIFAR pickle batch as an (N, 32, 32, 3) BGR array."""
+    with open(path, 'rb') as fo:
         with warnings.catch_warnings():
             # The CIFAR pickle carries a dtype pickled by an ancient NumPy with
             # `align=0`; NumPy 2.4 deprecates the int form. Nothing we can fix
@@ -97,6 +121,28 @@ def get_gallery(input_dir: str) -> np.ndarray:
         temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
         # Contiguous because cv2 will not take a reverse-strided view later.
         return np.ascontiguousarray(temp[..., ::-1])  # RGB -> BGR
+
+
+class CifarGallery:
+    """Tiles from a CIFAR-100 pickle batch. 32x32 images, resized to cell size."""
+
+    def __init__(self, path: Path):
+        self._path = Path(path)
+
+    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+        return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size)
+
+
+class VideoGallery:
+    """Tiles decoded from a video (or a directory of them), keeping every
+    `stride`-th frame. Not implemented yet — see plan 2.1."""
+
+    def __init__(self, path: Path, stride: int = 10):
+        self._path = Path(path)
+        self._stride = stride
+
+    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+        raise NotImplementedError("VideoGallery lands in phase 2.1")
 
 
 def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
@@ -144,12 +190,6 @@ def stream_frames(config: UserConfig, derived: DerivedConfig) -> Iterator[np.nda
     cap.release()
 
 
-def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple) -> np.ndarray:
-    """Pre-resize every gallery image to cell size once, ahead of the per-frame loop."""
-    cell_w, cell_h = cell_size
-    return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
-
-
 class BrightnessMetric:
     """Match each cell to a gallery image of near-identical average brightness.
 
@@ -176,6 +216,14 @@ class BrightnessMetric:
 
     def precompute(self, gallery: np.ndarray, cell_size: tuple[int, int],
                    brightness: np.ndarray | None = None) -> None:
+        # The gallery arrives at cell size from its `GallerySource`, so there is
+        # nothing to resize here — only to check, since a mismatch would
+        # otherwise surface as a silently misshapen mosaic much later.
+        cell_w, cell_h = cell_size
+        if gallery.shape[1:3] != (cell_h, cell_w):
+            raise ValueError(f"gallery tiles are {gallery.shape[2]}x{gallery.shape[1]}, "
+                             f"expected cell size {cell_w}x{cell_h}")
+
         bright = gallery_brightness(gallery) if brightness is None else brightness
         order = np.argsort(bright)
         sorted_bright = bright[order]
@@ -219,7 +267,7 @@ class BrightnessMetric:
         self._remap[reachable] = np.arange(len(reachable))
 
         self._lo, self._count = lo, count
-        self._tiles = resize_gallery_to_cells(gallery[order[reachable]], cell_size)
+        self._tiles = gallery[order[reachable]]
         self._cell_w, self._cell_h = cell_size
 
     def match(self, frame: np.ndarray) -> np.ndarray:
@@ -268,7 +316,7 @@ def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
 
     return gallery[mask], brightness[mask]
 
-def main():
+def main(gallery_source: GallerySource):
     config = UserConfig(input_dir="./assets/source.mp4",
                         output_dir="./output/",
                         contrast=1.0,
@@ -278,11 +326,14 @@ def main():
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    gallery = get_gallery(input_dir="./assets/gallery/train")
+    # Probe first: the gallery cannot be loaded until the cell size is known,
+    # because tiles are only ever stored at cell resolution.
+    derived = probe_video(config)
+
+    gallery = gallery_source.load(derived.cell_size)
     brightness = gallery_brightness(gallery)
     gallery_shrunk, brightness_shrunk = shrink_gallery(gallery, brightness, config)
 
-    derived = probe_video(config)
     metric = BrightnessMetric(candidates=config.candidates,
                               epsilon=config.epsilon, seed=config.seed)
     metric.precompute(gallery_shrunk, derived.cell_size, brightness_shrunk)
@@ -328,4 +379,4 @@ def main():
     print(f"Done. Output written to {config.output_dir}")
 
 if __name__ == "__main__":
-    main()
+    main(CifarGallery(Path("./assets/gallery/train")))
