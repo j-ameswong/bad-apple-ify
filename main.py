@@ -390,67 +390,112 @@ def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
 
     return gallery[mask], brightness[mask]
 
-def main(gallery_source: GallerySource):
-    config = UserConfig(input_dir="./assets/source.mp4",
-                        output_dir="./output/",
-                        contrast=1.0,
-                        grid_size=8
-                        )
 
-    output = Path(config.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+def build_metric(gallery: np.ndarray, config: UserConfig,
+                 derived: DerivedConfig) -> BrightnessMetric:
+    """Trim the gallery and precompute the matcher over what survives."""
+    brightness = gallery_brightness(gallery)
+    gallery, brightness = shrink_gallery(gallery, brightness, config)
+
+    metric = BrightnessMetric(candidates=config.candidates,
+                              epsilon=config.epsilon, seed=config.seed)
+    metric.precompute(gallery, derived.cell_size, brightness)
+    print(f"Gallery: {len(gallery)} images -> {len(metric.tiles)} usable tiles, "
+          f"{metric.bucket_size:.0f} candidates per cell (median)")
+    return metric
+
+
+def build_mosaics(frames: Iterator[np.ndarray], metric: BrightnessMetric,
+                  derived: DerivedConfig) -> Iterator[np.ndarray]:
+    """Turn a stream of source frames into a stream of mosaics.
+
+    Stays lazy end to end: one frame in, one mosaic out, so peak memory holds a
+    couple of frames however long the source is. The frame count is only a tqdm
+    hint — it comes from container metadata and may be wrong or absent.
+    """
+    for frame in tqdm.tqdm(frames, desc="Building mosaics...",
+                           total=derived.src_frame_count or None):
+        yield mosaic_frame(frame, metric)
+
+
+def encode_video(mosaics: Iterator[np.ndarray], derived: DerivedConfig,
+                 output_path: Path) -> Path:
+    """Pipe raw mosaic frames into ffmpeg and return the encoded file's path."""
+    width, height = derived.target_dimensions
+    proc = subprocess.Popen([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-framerate", str(derived.output_fps),
+        "-i", "-",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-y", str(output_path)
+    ], stdin=subprocess.PIPE)
+
+    try:
+        for mosaic in mosaics:
+            proc.stdin.write(mosaic.tobytes())
+    except BrokenPipeError:
+        # ffmpeg died early; its own exit code below is the useful error, not
+        # the write failure it caused.
+        pass
+    finally:
+        proc.stdin.close()
+        proc.wait()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg encode failed with exit code {proc.returncode}")
+    return output_path
+
+
+def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
+                   dimensions: tuple[int, int]) -> Path:
+    """Stack the source and its mosaic side by side into one video.
+
+    `hstack` requires both inputs to be the same height, and the mosaic is only
+    incidentally the source's size — the target dimensions are snapped to a grid
+    multiple. Scale the source to `dimensions` rather than relying on that.
+    """
+    print("Combining source and mosaic side by side...")
+    width, height = dimensions
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-i", str(source_path),
+        "-i", str(mosaic_path),
+        "-filter_complex",
+        f"[0:v]scale={width}:{height},setsar=1[src];[src][1:v]hstack=inputs=2",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-pix_fmt", "yuv420p",
+        "-y", str(output_path)
+    ], check=True, stdin=subprocess.DEVNULL)
+    return output_path
+
+
+def main(gallery_source: GallerySource, config: UserConfig) -> Path:
+    """Run the pipeline end to end, returning the combined video's path."""
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Probe first: the gallery cannot be loaded until the cell size is known,
     # because tiles are only ever stored at cell resolution.
     derived = probe_video(config)
-
     gallery = load_gallery(gallery_source, derived)
-    brightness = gallery_brightness(gallery)
-    gallery_shrunk, brightness_shrunk = shrink_gallery(gallery, brightness, config)
+    metric = build_metric(gallery, config, derived)
 
-    metric = BrightnessMetric(candidates=config.candidates,
-                              epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(gallery_shrunk, derived.cell_size, brightness_shrunk)
-    print(f"Gallery: {len(gallery_shrunk)} images -> {len(metric.tiles)} usable tiles, "
-          f"{metric.bucket_size:.0f} candidates per cell (median)")
+    frames = stream_frames(config, derived)
+    mosaics = build_mosaics(frames, metric, derived)
+    mosaic_path = encode_video(mosaics, derived, output_dir / "output.mp4")
 
-    tw, th = derived.target_dimensions
-    output_path = f"{config.output_dir}/output.mp4"
-    proc = subprocess.Popen([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{tw}x{th}", "-framerate", str(derived.output_fps),
-        "-i", "-",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-y", output_path
-    ], stdin=subprocess.PIPE)
+    combined = combine_videos(Path(config.input_dir), mosaic_path,
+                              output_dir / "combined.mp4",
+                              derived.target_dimensions)
+    print(f"Done. Output written to {output_dir}")
+    return combined
 
-    for frame in tqdm.tqdm(stream_frames(config, derived), desc="Building mosaics...",
-                           total=derived.src_frame_count or None):
-        mosaic = mosaic_frame(frame, metric)
-        proc.stdin.write(mosaic.tobytes())
-
-    proc.stdin.close()
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg encode failed with exit code {proc.returncode}")
-
-    # Combine source and output side by side
-    print("Combining source and mosaic side by side...")
-    # hstack requires both inputs to be the same height, and the mosaic is only
-    # incidentally the source's size — compute_target_dimensions() snaps to a
-    # grid multiple. Scale the source to match rather than relying on that.
-    subprocess.run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-        "-i", config.input_dir,
-        "-i", f"{config.output_dir}/output.mp4",
-        "-filter_complex", f"[0:v]scale={tw}:{th},setsar=1[src];[src][1:v]hstack=inputs=2",
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-pix_fmt", "yuv420p",
-        "-y", f"{config.output_dir}/combined.mp4"
-    ], check=True, stdin=subprocess.DEVNULL)
-    print(f"Done. Output written to {config.output_dir}")
 
 if __name__ == "__main__":
-    main(CifarGallery(Path("./assets/gallery/train")))
+    main(CifarGallery(Path("./assets/gallery/train")),
+         UserConfig(input_dir="./assets/source.mp4",
+                    output_dir="./output/",
+                    contrast=1.0,
+                    grid_size=8))
