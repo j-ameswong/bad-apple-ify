@@ -32,16 +32,15 @@ class UserConfig:
 class DerivedConfig:
     """Everything computed from a `UserConfig` once the source has been probed.
 
-    Built once by `probe_video()` and never mutated afterwards, so the grid and
-    the frame size a run was set up with cannot drift apart mid-pipeline.
+    Built once by `probe_video()` and never mutated, so the grid and the frame
+    size a run was set up with cannot drift apart mid-pipeline. See
+    docs/grid-and-sizing.md for how the numbers below are chosen.
     """
 
     src_fps: int
     src_dimensions: tuple[int, int]
     src_frame_count: int
-    # Smallest integer pair approximating the source's aspect ratio. The grid
-    # only needs *some* integer pair, so any source keeps its own shape instead
-    # of being snapped to an allowlisted ratio.
+    # Smallest integer pair approximating the source's own aspect ratio.
     aspect_ratio: tuple[int, int]
     grid: tuple[int, int]
     cell_size: tuple[int, int]
@@ -49,25 +48,16 @@ class DerivedConfig:
     @classmethod
     def from_source(cls, config: UserConfig, *, fps: int,
                     dimensions: tuple[int, int], frame_count: int) -> "DerivedConfig":
-        # Any integer pair close to the source ratio will do, so take the
-        # simplest one rather than snapping to a fixed list — a 2.39:1 source
-        # should stay 2.39:1, not get stretched to 16:9. Capping the denominator
-        # keeps the pair small: an exact reduction of e.g. 2048x858 is 1024:429,
-        # which is useless as a grid multiplier.
+        # Simplest integer pair near the source ratio, so a 2.39:1 source stays
+        # 2.39:1. The denominator cap keeps it usable as a multiplier.
         ratio = Fraction(*dimensions).limit_denominator(16)
         aspect_ratio = (ratio.numerator, ratio.denominator)
-        # grid_size=1 is single-frame mode: one cell covering the whole frame,
-        # so every output frame is a single gallery image rather than a
-        # composite. It needs no separate code path, only a grid that is
-        # actually 1x1 — multiplying the aspect pair by 1 would give a 4x3 grid
-        # of 12 tiles, which is neither a mosaic worth the name nor the single
-        # frame asked for. The cell then takes the source's own aspect ratio
-        # instead of the pair's, which is what a full-frame tile should do.
+        # grid_size=1 means single-frame mode, so the grid has to be a literal
+        # 1x1 rather than the aspect pair (which would give 12 tiles).
         grid = ((1, 1) if config.grid_size == 1
                 else (aspect_ratio[0] * config.grid_size,
                       aspect_ratio[1] * config.grid_size))
-        # Snap the frame to the nearest whole multiple of the grid, at least
-        # 1px per cell however fine the grid is.
+        # Nearest whole multiple of the grid, at least 1px per cell.
         cell_size = (max(round(dimensions[0] / grid[0]), 1),
                      max(round(dimensions[1] / grid[1]), 1))
         return cls(src_fps=fps, src_dimensions=dimensions,
@@ -95,24 +85,18 @@ class DerivedConfig:
 class GallerySource(Protocol):
     """A source of tiles, handed over already at cell size.
 
-    `load()` taking the cell size is the whole point of the protocol, not a
-    convenience: a video gallery is only tractable because frames are
-    downscaled *during* decode. 41k frames at 1080p is 257 GB, the same frames
-    at 16x16 are 32 MB. A source that promised full-resolution images could not
-    be implemented for video at all, so the protocol never promises them.
-
-    The cost is a load-order constraint: the source must be probed and the cell
-    size derived before any gallery can be loaded.
+    Tiles are never stored at full resolution, which is what makes a video
+    gallery tractable and what forces the probe-before-load ordering in
+    `main()`. See docs/gallery-sources.md.
     """
 
     @property
     def fingerprint(self) -> str:
         """Identifies what `load()` will return, ignoring cell size.
 
-        Everything that changes the tiles — the file(s) read, their mtimes, and
-        any sampling parameters — and nothing that doesn't. `load_gallery()`
-        keys its cache on this, so a source that under-reports here will serve
-        stale tiles.
+        Everything that changes the tiles (files read, their mtimes, sampling
+        parameters) and nothing that doesn't. `load_gallery()` keys its cache
+        on this, so under-reporting here serves stale tiles.
         """
         ...
 
@@ -131,9 +115,8 @@ def read_cifar_batch(path: Path) -> np.ndarray:
     """Read a CIFAR pickle batch as an (N, 32, 32, 3) BGR array."""
     with open(path, 'rb') as fo:
         with warnings.catch_warnings():
-            # The CIFAR pickle carries a dtype pickled by an ancient NumPy with
-            # `align=0`; NumPy 2.4 deprecates the int form. Nothing we can fix
-            # from this side short of re-serialising the file.
+            # Ancient NumPy pickled the dtype with `align=0`, which 2.4
+            # deprecates. Not fixable short of re-serialising the file.
             warnings.filterwarnings("ignore", message=".*align=0.*")
             data = pickle.load(fo, encoding='latin1')
         images = data['data']
@@ -179,13 +162,7 @@ DEFAULT_CACHE_DIR = Path(".cache/gallery")
 
 
 def cache_key(source: GallerySource, cell_size: tuple[int, int]) -> str:
-    """Filename-safe digest of everything that determines the loaded tiles.
-
-    Left as a plain string rather than a structured name so a metric's own
-    precompute could join the key later without changing the layout — though
-    for `BrightnessMetric` that would be caching a 10 ms computation behind a
-    38 MB read, so only the tiles are cached today.
-    """
+    """Filename-safe digest of everything that determines the loaded tiles."""
     material = f"{source.fingerprint}|cell={cell_size[0]}x{cell_size[1]}"
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
@@ -195,9 +172,8 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
                  use_cache: bool = True) -> np.ndarray:
     """Load tiles at the derived cell size, going through the on-disk cache.
 
-    A gallery load costs one decode pass over the whole source — ~12 minutes
-    for a season of anime — which is unusable to sit through on every run, and
-    the result is small enough to keep (41k tiles at 16x16 is 32 MB).
+    A load costs a full decode pass over the source, so it's worth keeping.
+    See docs/gallery-cache.md.
     """
     cell_size = derived.cell_size
     if not use_cache:
@@ -206,8 +182,7 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
     path = cache_dir / f"tiles-{cache_key(source, cell_size)}.npy"
     if path.exists():
         tiles = np.load(path)
-        # A truncated or hand-edited cache file is not worth trusting over a
-        # re-decode; the key already guarantees the tiles are otherwise current.
+        # A truncated or hand-edited file isn't worth trusting over a re-decode.
         if tiles.shape[1:] == (cell_size[1], cell_size[0], 3):
             print(f"Gallery cache hit: {path}")
             return tiles
@@ -215,8 +190,7 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
 
     tiles = source.load(cell_size)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Write-then-rename, so a run killed mid-write leaves the old cache intact
-    # rather than a half-file the next run would have to detect.
+    # Write-then-rename, so a run killed mid-write leaves the old cache intact.
     # Keeps the .npy extension, which np.save would otherwise append itself.
     temp = path.with_name(f"{path.name}.{os.getpid()}.tmp.npy")
     try:
@@ -231,7 +205,7 @@ def gallery_brightness(gallery: np.ndarray) -> np.ndarray:
     """Average brightness (0-1) for each gallery image.
 
     Luma is linear, so the mean of the luma equals the luma of the channel
-    means — one (N, 3) reduction instead of a per-image cvtColor.
+    means: one (N, 3) reduction instead of a per-image cvtColor.
     """
     return gallery.mean(axis=(1, 2)) @ LUMA_BGR / 255.0
 
@@ -275,20 +249,11 @@ def stream_frames(config: UserConfig, derived: DerivedConfig) -> Iterator[np.nda
 class BrightnessMetric:
     """Match each cell to a gallery image of near-identical average brightness.
 
-    A cell's brightness rounds to one of 256 levels, so every possible match is
-    resolved once at precompute time. Rather than pinning each level to a single
-    best image — which collapses a 40k gallery down to ~100 tiles and makes the
-    mosaic visibly repetitive — precompute gives each level a bucket of the
-    `candidates` images nearest it in brightness, and match() samples one
-    uniformly. Matching stays O(1) per cell and the whole gallery gets used.
-
-    `candidates` is the variety knob and means the same thing whatever the
-    gallery: a fixed brightness radius would over-sample a dense gallery and
-    starve a sparse one. `epsilon` is the accuracy ceiling — no candidate may
-    differ from the level by more than that, so a sparse gallery yields a
-    smaller bucket rather than a tonally wrong one. A level with nothing inside
-    epsilon (including epsilon=0, or candidates=1) falls back to the single
-    nearest image, i.e. the argmin answer.
+    A cell's brightness rounds to one of 256 levels, so precompute resolves
+    every possible match once: each level gets a bucket of the `candidates`
+    images nearest it (none further than `epsilon`), and match() samples one
+    uniformly. O(1) per cell, and the mosaic doesn't repeat itself. Rationale
+    for both knobs is in docs/brightness-matching.md.
     """
 
     def __init__(self, candidates: int = 1, epsilon: float = 0.0, seed: int = 0):
@@ -298,9 +263,8 @@ class BrightnessMetric:
 
     def precompute(self, gallery: np.ndarray, cell_size: tuple[int, int],
                    brightness: np.ndarray | None = None) -> None:
-        # The gallery arrives at cell size from its `GallerySource`, so there is
-        # nothing to resize here — only to check, since a mismatch would
-        # otherwise surface as a silently misshapen mosaic much later.
+        # Tiles arrive at cell size, so nothing to resize, only to check: a
+        # mismatch would otherwise surface as a misshapen mosaic much later.
         cell_w, cell_h = cell_size
         if gallery.shape[1:3] != (cell_h, cell_w):
             raise ValueError(f"gallery tiles are {gallery.shape[2]}x{gallery.shape[1]}, "
@@ -322,9 +286,9 @@ class BrightnessMetric:
         lo = np.empty(256, dtype=np.int64)
         count = np.empty(256, dtype=np.int64)
         for i, level in enumerate(levels):
-            # Centre a k-wide window on the level, then slide it onto the true k
-            # nearest — brightness is not uniformly spread, so the midpoint of
-            # the window is not the midpoint of the gallery around it.
+            # Centre a k-wide window on the level, then slide it onto the true
+            # k nearest: brightness isn't spread uniformly, so the midpoint of
+            # the window isn't the midpoint of the gallery around it.
             start = min(max(insert[i] - k // 2, 0), n - k)
             while start > 0 and level - sorted_bright[start - 1] < sorted_bright[start + k - 1] - level:
                 start -= 1
@@ -340,7 +304,8 @@ class BrightnessMetric:
                 end = begin + 1
             lo[i], count[i] = begin, end - begin
 
-        # Compact the gallery down to the images some bucket can actually reach.
+        # Compact the gallery to the images some bucket can actually reach,
+        # counting span coverage with a difference array.
         spans = np.zeros(n + 1, dtype=np.int64)
         np.add.at(spans, lo, 1)
         np.add.at(spans, lo + count, -1)
@@ -388,8 +353,8 @@ def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
                    config: UserConfig) -> tuple[np.ndarray, np.ndarray]:
     """Trim the gallery to a percentile band of brightness around the midpoint.
 
-    Takes the brightnesses rather than recomputing them, and returns the
-    surviving ones alongside the images so the caller never needs a second pass.
+    Takes the brightnesses rather than recomputing them, and hands back the
+    survivors alongside the images so the caller needs no second pass.
     """
     percentiles = (50 - (50 * config.contrast), 50 + (50 * config.contrast))
     low = np.percentile(brightness, percentiles[0])
@@ -417,9 +382,9 @@ def build_mosaics(frames: Iterator[np.ndarray], metric: BrightnessMetric,
                   derived: DerivedConfig) -> Iterator[np.ndarray]:
     """Turn a stream of source frames into a stream of mosaics.
 
-    Stays lazy end to end: one frame in, one mosaic out, so peak memory holds a
-    couple of frames however long the source is. The frame count is only a tqdm
-    hint — it comes from container metadata and may be wrong or absent.
+    Lazy end to end: one frame in, one mosaic out, so peak memory holds a couple
+    of frames however long the source is. The frame count is only a tqdm hint,
+    since container metadata may be wrong or absent.
     """
     for frame in tqdm.tqdm(frames, desc="Building mosaics...",
                            total=derived.src_frame_count or None):
@@ -443,8 +408,7 @@ def encode_video(mosaics: Iterator[np.ndarray], derived: DerivedConfig,
         for mosaic in mosaics:
             proc.stdin.write(mosaic.tobytes())
     except BrokenPipeError:
-        # ffmpeg died early; its own exit code below is the useful error, not
-        # the write failure it caused.
+        # ffmpeg died early; its exit code below is the useful error.
         pass
     finally:
         proc.stdin.close()
@@ -459,9 +423,9 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
                    dimensions: tuple[int, int]) -> Path:
     """Stack the source and its mosaic side by side into one video.
 
-    `hstack` requires both inputs to be the same height, and the mosaic is only
-    incidentally the source's size — the target dimensions are snapped to a grid
-    multiple. Scale the source to `dimensions` rather than relying on that.
+    `hstack` wants both inputs at the same height, and target dimensions are
+    snapped to a grid multiple, so the source gets scaled rather than trusted
+    to match.
     """
     print("Combining source and mosaic side by side...")
     width, height = dimensions
@@ -484,8 +448,8 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probe first: the gallery cannot be loaded until the cell size is known,
-    # because tiles are only ever stored at cell resolution.
+    # Probe first: tiles are only ever stored at cell resolution, so the
+    # gallery can't load until the cell size is known.
     derived = probe_video(config)
     gallery = load_gallery(gallery_source, derived)
     metric = build_metric(gallery, config, derived)
