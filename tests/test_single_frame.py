@@ -39,6 +39,9 @@ class _source:
     def fingerprint(self) -> str:
         return "test-array"
 
+    def estimate_count(self) -> int:
+        return len(self._gallery)
+
     def load(self, cell_size):
         return resize_gallery_to_cells(self._gallery, cell_size)
 

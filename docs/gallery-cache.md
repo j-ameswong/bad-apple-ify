@@ -19,6 +19,9 @@ behind a 38 MB read, so only the tiles are cached today.
 
 ## Reads and writes
 
+A cache hit skips the [size estimate](gallery-size.md) — the file on disk is the
+real answer, so there's nothing left to guess about.
+
 A cache hit still checks the array's shape against the expected cell size. A
 truncated or hand-edited file isn't worth trusting over a re-decode, and the key
 already guarantees the tiles are otherwise current.

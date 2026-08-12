@@ -1,7 +1,8 @@
 # Gallery sources
 
 `GallerySource` is the protocol every tile source implements: `load(cell_size)`
-returns `(N, cell_h, cell_w, 3)` BGR tiles, plus a `fingerprint` string.
+returns `(N, cell_h, cell_w, 3)` BGR tiles, plus a `fingerprint` string and an
+`estimate_count()`.
 
 ## Why `load()` takes the cell size
 
@@ -21,6 +22,14 @@ size derived before any gallery can load. That's why `main()` calls
 everything that changes the tiles (the files read, their mtimes, any sampling
 parameters) and nothing that doesn't. The [tile cache](gallery-cache.md) keys on
 it, so a source that under-reports here will happily serve stale tiles.
+
+## The estimate
+
+`estimate_count()` is a cheap, deliberately rough guess at how many tiles
+`load()` will hand back, so `load_gallery()` can price the array before paying
+for a decode. Over-reporting is harmless, under-reporting defeats the point, and
+`None` means the source genuinely can't tell. See
+[sizing the gallery](gallery-size.md).
 
 ## Implementations
 

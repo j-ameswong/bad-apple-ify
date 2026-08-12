@@ -14,6 +14,11 @@ import subprocess
 # Rec.601 luma weights in BGR order — what cv2.COLOR_BGR2GRAY applies.
 LUMA_BGR = np.array([0.114, 0.587, 0.299])
 
+# Tile-array sizes worth saying something about, in bytes. Past the soft one it
+# is worth a warning; past the hard one the load stops. See docs/gallery-size.md.
+SOFT_BUDGET = 1 << 30  # 1 GB
+HARD_BUDGET = 8 << 30  # 8 GB
+
 
 @dataclass(frozen=True)
 class UserConfig:
@@ -26,6 +31,7 @@ class UserConfig:
     candidates: int = 256  # tiles to sample from per brightness level
     epsilon: float = 0.005  # max brightness error (0-1) a candidate may have
     seed: int = 0
+    gallery_budget: int = HARD_BUDGET  # bytes of tiles to refuse past
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,15 @@ class GallerySource(Protocol):
         """
         ...
 
+    def estimate_count(self) -> int | None:
+        """Roughly how many tiles `load()` will return, cheaply. None if unknowable.
+
+        Only ever an estimate, and preferably an over-estimate: it exists to
+        catch a hopeless allocation before a decode pass pays for it, so
+        erring high is free and erring low defeats the point.
+        """
+        ...
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         """(N, cell_h, cell_w, 3) BGR tiles at the given (width, height) cell size."""
         ...
@@ -109,6 +124,13 @@ def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple[int, int]) -> 
     """Resize every gallery image to cell size once, at load time."""
     cell_w, cell_h = cell_size
     return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
+
+
+# One CIFAR image on disk: 32*32*3 planar uint8.
+CIFAR_IMAGE_BYTES = 3072
+
+# What a directory gallery counts as a video.
+VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"})
 
 
 def read_cifar_batch(path: Path) -> np.ndarray:
@@ -137,6 +159,12 @@ class CifarGallery:
     def fingerprint(self) -> str:
         return f"cifar:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
 
+    def estimate_count(self) -> int | None:
+        # A batch is N x 3072 planar uint8 bytes plus labels and filenames, so
+        # dividing the file size over-reports a touch: 50537 against a real
+        # 50000 on the CIFAR-100 train batch, 1.1% high. Fine for a budget.
+        return self._path.stat().st_size // CIFAR_IMAGE_BYTES
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size)
 
@@ -149,10 +177,42 @@ class VideoGallery:
         self._path = Path(path)
         self._stride = stride
 
+    def _files(self) -> list[Path]:
+        """The videos this gallery reads, in a stable order."""
+        if self._path.is_dir():
+            return sorted(p for p in self._path.iterdir()
+                          if p.suffix.lower() in VIDEO_SUFFIXES)
+        return [self._path]
+
     @property
     def fingerprint(self) -> str:
-        return (f"video:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
-                f":stride={self._stride}")
+        files = ",".join(f"{p.resolve()}:{p.stat().st_mtime_ns}" for p in self._files())
+        return f"video:{files}:stride={self._stride}"
+
+    def estimate_count(self) -> int | None:
+        """Frame count over stride, summed over the files. Upper bound.
+
+        Container metadata, so it can lie — fine for an order-of-magnitude
+        warning, never for sizing an allocation. Measured exact on the three
+        rips to hand. Dedupe (plan 2.1) only ever drops tiles, so the real
+        count comes in under this.
+        """
+        total = 0
+        for path in self._files():
+            cap = cv2.VideoCapture(str(path))
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            if frames <= 0:
+                # No frame count in the container; duration x fps is the backup,
+                # and seeking to the end is how OpenCV will tell you a duration.
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+                ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                frames = fps * ms / 1000.0 if fps > 0 and ms > 0 else 0
+            cap.release()
+            if frames <= 0:
+                return None
+            total += -(-int(frames) // self._stride)
+        return total
 
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         raise NotImplementedError("VideoGallery lands in phase 2.1")
@@ -167,20 +227,60 @@ def cache_key(source: GallerySource, cell_size: tuple[int, int]) -> str:
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
+class GalleryTooLarge(RuntimeError):
+    """The tile array would blow the budget, so nothing was loaded."""
+
+
+def format_bytes(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.3g} {unit}"
+        size /= 1024
+    return f"{size:.3g} TB"
+
+
+def check_gallery_budget(source: GallerySource, cell_size: tuple[int, int],
+                         budget: int = HARD_BUDGET) -> None:
+    """Price the tile array before anything is decoded, and say so.
+
+    Both factors are the user's to set and they multiply, so the array is easy
+    to blow up by a character's difference — hence a refusal rather than a
+    warning at the top end. See docs/gallery-size.md.
+    """
+    count = source.estimate_count()
+    cell_w, cell_h = cell_size
+    if count is None:
+        print(f"Gallery size unknown: this source can't estimate its tile count. "
+              f"Each tile is {cell_w}x{cell_h}x3 B.")
+        return
+
+    size = count * cell_h * cell_w * 3
+    arithmetic = (f"~{count} tiles x {cell_w}x{cell_h}x3 B = "
+                  f"{format_bytes(size)}")
+    if size >= budget:
+        raise GalleryTooLarge(
+            f"Gallery needs {arithmetic}, over the {format_bytes(budget)} budget. "
+            f"Raise grid_size for a smaller cell, or stride for fewer tiles — "
+            f"or raise gallery_budget if you really do have the RAM.")
+    if size >= SOFT_BUDGET:
+        print(f"WARNING: gallery is {arithmetic}, all of it held in RAM. "
+              f"Raise grid_size for a smaller cell, or stride for fewer tiles.")
+    else:
+        print(f"Gallery estimate: {arithmetic}")
+
+
 def load_gallery(source: GallerySource, derived: DerivedConfig, *,
                  cache_dir: Path = DEFAULT_CACHE_DIR,
-                 use_cache: bool = True) -> np.ndarray:
+                 use_cache: bool = True,
+                 budget: int = HARD_BUDGET) -> np.ndarray:
     """Load tiles at the derived cell size, going through the on-disk cache.
 
     A load costs a full decode pass over the source, so it's worth keeping.
     See docs/gallery-cache.md.
     """
     cell_size = derived.cell_size
-    if not use_cache:
-        return source.load(cell_size)
-
     path = cache_dir / f"tiles-{cache_key(source, cell_size)}.npy"
-    if path.exists():
+    if use_cache and path.exists():
         tiles = np.load(path)
         # A truncated or hand-edited file isn't worth trusting over a re-decode.
         if tiles.shape[1:] == (cell_size[1], cell_size[0], 3):
@@ -188,7 +288,13 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
             return tiles
         print(f"Gallery cache at {path} is malformed, reloading")
 
+    # Estimate only on the path that actually decodes. A cache hit already knows
+    # the true size and has paid for it.
+    check_gallery_budget(source, cell_size, budget)
     tiles = source.load(cell_size)
+    if not use_cache:
+        return tiles
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Write-then-rename, so a run killed mid-write leaves the old cache intact.
     # Keeps the .npy extension, which np.save would otherwise append itself.
@@ -451,7 +557,7 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     # Probe first: tiles are only ever stored at cell resolution, so the
     # gallery can't load until the cell size is known.
     derived = probe_video(config)
-    gallery = load_gallery(gallery_source, derived)
+    gallery = load_gallery(gallery_source, derived, budget=config.gallery_budget)
     metric = build_metric(gallery, config, derived)
 
     frames = stream_frames(config, derived)

@@ -23,6 +23,9 @@ class CountingSource:
     def fingerprint(self) -> str:
         return self._fingerprint
 
+    def estimate_count(self) -> int:
+        return len(self._tiles)
+
     def load(self, cell_size: tuple[int, int]) -> np.ndarray:
         self.loads += 1
         cell_w, cell_h = cell_size
