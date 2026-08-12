@@ -121,9 +121,19 @@ class GallerySource(Protocol):
 
 
 def resize_gallery_to_cells(gallery: np.ndarray, cell_size: tuple[int, int]) -> np.ndarray:
-    """Resize every gallery image to cell size once, at load time."""
+    """Resize every gallery image to cell size once, at load time.
+
+    Allocated once and filled in place. Stacking a list comprehension instead
+    holds every tile twice at the moment `np.array` copies it, which doubles
+    peak RAM on the one allocation the budget check is meant to police.
+    """
     cell_w, cell_h = cell_size
-    return np.array([cv2.resize(img, (cell_w, cell_h)) for img in gallery])
+    tiles = np.empty((len(gallery), cell_h, cell_w, 3), dtype=gallery.dtype)
+    for tile, img in zip(tiles, gallery):
+        # dst= only writes in place while the shape and dtype match exactly;
+        # otherwise cv2 quietly allocates its own and the write is lost.
+        cv2.resize(img, (cell_w, cell_h), dst=tile)
+    return tiles
 
 
 # One CIFAR image on disk: 32*32*3 planar uint8.
@@ -460,12 +470,18 @@ def shrink_gallery(gallery: np.ndarray, brightness: np.ndarray,
     """Trim the gallery to a percentile band of brightness around the midpoint.
 
     Takes the brightnesses rather than recomputing them, and hands back the
-    survivors alongside the images so the caller needs no second pass.
+    survivors alongside the images so the caller needs no second pass. When
+    nothing is trimmed it hands back the very arrays it was given.
     """
     percentiles = (50 - (50 * config.contrast), 50 + (50 * config.contrast))
     low = np.percentile(brightness, percentiles[0])
     high = np.percentile(brightness, percentiles[1])
     mask = (brightness >= low) & (brightness <= high)
+    if mask.all():
+        # contrast=1.0 keeps everything, and boolean indexing would still copy
+        # the lot: a second full-size array alive beside the first, which is
+        # the peak of the whole run. See docs/gallery-size.md.
+        return gallery, brightness
 
     return gallery[mask], brightness[mask]
 
@@ -474,6 +490,9 @@ def build_metric(gallery: np.ndarray, config: UserConfig,
                  derived: DerivedConfig) -> BrightnessMetric:
     """Trim the gallery and precompute the matcher over what survives."""
     brightness = gallery_brightness(gallery)
+    # Rebinding drops the last reference to the loaded tiles, provided the
+    # caller kept none either, so precompute's copy replaces them rather than
+    # joining them. See docs/gallery-size.md.
     gallery, brightness = shrink_gallery(gallery, brightness, config)
 
     metric = BrightnessMetric(candidates=config.candidates,
@@ -557,8 +576,12 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     # Probe first: tiles are only ever stored at cell resolution, so the
     # gallery can't load until the cell size is known.
     derived = probe_video(config)
-    gallery = load_gallery(gallery_source, derived, budget=config.gallery_budget)
-    metric = build_metric(gallery, config, derived)
+    # Handed straight over rather than kept in a local: nothing here reads the
+    # loaded tiles again, and a name pinning them would keep the whole array
+    # alive beside the metric's own copy for the rest of the run.
+    metric = build_metric(
+        load_gallery(gallery_source, derived, budget=config.gallery_budget),
+        config, derived)
 
     frames = stream_frames(config, derived)
     mosaics = build_mosaics(frames, metric, derived)
