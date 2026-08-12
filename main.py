@@ -56,8 +56,16 @@ class DerivedConfig:
         # which is useless as a grid multiplier.
         ratio = Fraction(*dimensions).limit_denominator(16)
         aspect_ratio = (ratio.numerator, ratio.denominator)
-        grid = (aspect_ratio[0] * config.grid_size,
-                aspect_ratio[1] * config.grid_size)
+        # grid_size=1 is single-frame mode: one cell covering the whole frame,
+        # so every output frame is a single gallery image rather than a
+        # composite. It needs no separate code path, only a grid that is
+        # actually 1x1 — multiplying the aspect pair by 1 would give a 4x3 grid
+        # of 12 tiles, which is neither a mosaic worth the name nor the single
+        # frame asked for. The cell then takes the source's own aspect ratio
+        # instead of the pair's, which is what a full-frame tile should do.
+        grid = ((1, 1) if config.grid_size == 1
+                else (aspect_ratio[0] * config.grid_size,
+                      aspect_ratio[1] * config.grid_size))
         # Snap the frame to the nearest whole multiple of the grid, at least
         # 1px per cell however fine the grid is.
         cell_size = (max(round(dimensions[0] / grid[0]), 1),

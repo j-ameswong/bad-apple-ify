@@ -79,6 +79,26 @@ def test_grid_size_scales_the_grid_not_the_ratio():
     assert (fine.grid_x, fine.grid_y) == (coarse.grid_x * 2, coarse.grid_y * 2)
 
 
+def test_grid_size_one_collapses_to_a_single_cell():
+    """2.4: grid_size=1 is single-frame mode — one cell over the whole frame.
+
+    Not 4x3: multiplying the aspect pair by 1 would give twelve tiles, which is
+    not the single gallery image per frame the mode is for.
+    """
+    derived = derive(64, 48, grid_size=1)
+
+    assert (derived.grid_x, derived.grid_y) == (1, 1)
+    assert derived.cell_size == (64, 48)
+    assert derived.target_dimensions == (64, 48)
+
+
+def test_single_frame_cell_keeps_the_source_shape():
+    """The one cell is the frame, so it takes the source's ratio, not the pair's."""
+    derived = derive(478, 200, grid_size=1)
+
+    assert derived.cell_size == (478, 200)
+
+
 def test_derivation_is_a_pure_function_of_its_inputs():
     """Same UserConfig and same source dimensions -> identical DerivedConfig."""
     assert derive(478, 200, grid_size=3) == derive(478, 200, grid_size=3)
