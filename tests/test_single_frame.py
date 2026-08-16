@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 from conftest import read_video
-from main import (CifarGallery, UserConfig, build_metric, build_mosaics,
-                  load_gallery, main, mosaic_frame, probe_video,
+from main import (CifarGallery, HARD_BUDGET, UserConfig, build_metric,
+                  build_mosaics, load_gallery, main, mosaic_frame, probe_video,
                   resize_gallery_to_cells, stream_frames)
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None,
@@ -39,11 +39,15 @@ class _source:
     def fingerprint(self) -> str:
         return "test-array"
 
+    @property
+    def native_aspect(self):
+        return (1, 1)
+
     def estimate_count(self) -> int:
         return len(self._gallery)
 
-    def load(self, cell_size):
-        return resize_gallery_to_cells(self._gallery, cell_size)
+    def load(self, cell_size, fit="native", budget=HARD_BUDGET):
+        return resize_gallery_to_cells(self._gallery, cell_size, fit)
 
 
 def test_every_output_frame_is_one_whole_gallery_image(video, gallery, tmp_path):

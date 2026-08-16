@@ -11,11 +11,19 @@ result is small enough to keep around: 41k tiles at 16x16 is 32 MB.
 
 ## The key
 
-`cache_key()` is a sha256 of the source's fingerprint plus the cell size,
+`cache_key()` is a sha256 of the source's fingerprint plus the cell size and
+the [fit](tile-shape.md),
 truncated to 16 hex characters. It's a plain digest rather than a structured
 filename so a metric's own precompute could join the key later without changing
 the layout. For `BrightnessMetric` that would mean caching a 10 ms computation
 behind a 38 MB read, so only the tiles are cached today.
+
+`TILE_VERSION` rides along in the key for the things it can't otherwise see.
+The fingerprint covers what went in and the cell size and fit cover the shape,
+but neither says anything about *how* the resize was done, so changing the
+interpolation (v1 to v2, bilinear to INTER_AREA) would have served the old
+pixels forever. Bump it whenever the same inputs start producing different
+tiles.
 
 ## Reads and writes
 

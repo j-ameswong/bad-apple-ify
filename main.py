@@ -1,4 +1,4 @@
-from typing import Iterator, Protocol, cast
+from typing import Iterator, Literal, Protocol, cast
 import numpy as np
 import numpy.typing as npt
 import cv2
@@ -17,6 +17,9 @@ type Image = npt.NDArray[np.uint8]
 type Brightness = npt.NDArray[np.float64]
 type Indices = npt.NDArray[np.int64]
 
+# How a gallery image fills a cell it doesn't share a shape with.
+type Fit = Literal["native", "crop", "stretch"]
+
 # Rec.601 luma weights in BGR order — what cv2.COLOR_BGR2GRAY applies.
 LUMA_BGR = np.array([0.114, 0.587, 0.299])
 
@@ -33,6 +36,7 @@ class UserConfig:
     output_dir: str
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
+    tile_fit: Fit = "native"  # cell takes the tiles' own ratio, or crop/stretch into it
     candidates: int = 256  # tiles to sample from per brightness level
     epsilon: float = 0.005  # max brightness error (0-1) a candidate may have
     seed: int = 0
@@ -57,7 +61,8 @@ class DerivedConfig:
 
     @classmethod
     def from_source(cls, config: UserConfig, *, fps: int,
-                    dimensions: tuple[int, int], frame_count: int) -> "DerivedConfig":
+                    dimensions: tuple[int, int], frame_count: int,
+                    tile_aspect: tuple[int, int] | None = None) -> "DerivedConfig":
         # Simplest integer pair near the source ratio, so 2.39:1 stays 2.39:1.
         ratio = Fraction(*dimensions).limit_denominator(16)
         aspect_ratio = (ratio.numerator, ratio.denominator)
@@ -68,6 +73,18 @@ class DerivedConfig:
         # Nearest whole multiple of the grid, at least 1px per cell.
         cell_size = (max(round(dimensions[0] / grid[0]), 1),
                      max(round(dimensions[1] / grid[1]), 1))
+
+        if tile_aspect is not None and config.grid_size > 1:
+            # Rows stay put, the cell takes the tiles' ratio, and the columns are
+            # however many then fit across. Across the *snapped* width, mind —
+            # the raw source width stopped sharing a scale with the cell the
+            # moment the rows rounded. See docs/grid-and-sizing.md.
+            cell_h = cell_size[1]
+            snapped_w = grid[0] * cell_size[0]
+            cell_w = max(round(cell_h * tile_aspect[0] / tile_aspect[1]), 1)
+            grid = (max(round(snapped_w / cell_w), 1), grid[1])
+            cell_size = (cell_w, cell_h)
+
         return cls(src_fps=fps, src_dimensions=dimensions,
                    src_frame_count=frame_count, aspect_ratio=aspect_ratio,
                    grid=grid, cell_size=cell_size)
@@ -105,6 +122,14 @@ class GallerySource(Protocol):
         """
         ...
 
+    @property
+    def native_aspect(self) -> tuple[int, int] | None:
+        """The ratio the source's own images are shaped to. None if they vary.
+
+        `tile_fit="native"` shapes the cell to this, so tiles never distort.
+        """
+        ...
+
     def estimate_count(self) -> int | None:
         """Roughly how many tiles `load()` will return, cheaply. None if unknowable.
 
@@ -112,12 +137,50 @@ class GallerySource(Protocol):
         """
         ...
 
-    def load(self, cell_size: tuple[int, int]) -> Image:
-        """(N, cell_h, cell_w, 3) BGR tiles at the given (width, height) cell size."""
+    def load(self, cell_size: tuple[int, int], fit: Fit = "native",
+             budget: int = HARD_BUDGET) -> Image:
+        """(N, cell_h, cell_w, 3) BGR tiles at the given (width, height) cell size.
+
+        `budget` is the same ceiling `check_gallery_budget()` priced the estimate
+        against, for a source that can only find out the real count as it goes.
+        """
         ...
 
 
-def resize_gallery_to_cells(gallery: Image, cell_size: tuple[int, int]) -> Image:
+def crop_to_aspect(image: Image, cell_size: tuple[int, int]) -> Image:
+    """The largest centred rectangle of `image` with the cell's aspect ratio."""
+    cell_w, cell_h = cell_size
+    h, w = image.shape[:2]
+    if w * cell_h > h * cell_w:  # too wide — trim the sides
+        crop_w, crop_h = max(round(h * cell_w / cell_h), 1), h
+    else:  # too tall — trim top and bottom
+        crop_w, crop_h = w, max(round(w * cell_h / cell_w), 1)
+    x, y = (w - crop_w) // 2, (h - crop_h) // 2
+    return image[y:y + crop_h, x:x + crop_w]
+
+
+def fit_to_cell(image: Image, cell_size: tuple[int, int], fit: Fit = "native",
+                dst: Image | None = None) -> Image:
+    """Shrink one image to cell size, cropping first unless asked to stretch.
+
+    Under `native` the cell already carries the tiles' ratio, so the crop is a
+    no-op — except in single-frame mode, where the cell is the source frame.
+    """
+    source = image if fit == "stretch" else crop_to_aspect(image, cell_size)
+    src_h, src_w = source.shape[:2]
+    # Bilinear reads a 2x2 neighbourhood, so 1080p into a 14x8 tile samples the
+    # frame rather than averaging it and the brightness lands nowhere near the
+    # truth. AREA averages, but degenerates to nearest going up (single-frame
+    # mode blows 32x32 CIFAR up to the whole frame), hence the switch.
+    shrinking = cell_size[0] <= src_w and cell_size[1] <= src_h
+    # dst= needs an exact shape and dtype match or cv2 quietly drops the write.
+    return cast(Image, cv2.resize(
+        source, cell_size, dst=dst,
+        interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR))
+
+
+def resize_gallery_to_cells(gallery: Image, cell_size: tuple[int, int],
+                            fit: Fit = "native") -> Image:
     """Resize every gallery image to cell size once, at load time.
 
     Filled in place: stacking a list comprehension would hold every tile twice
@@ -126,8 +189,7 @@ def resize_gallery_to_cells(gallery: Image, cell_size: tuple[int, int]) -> Image
     cell_w, cell_h = cell_size
     tiles = np.empty((len(gallery), cell_h, cell_w, 3), dtype=gallery.dtype)
     for tile, img in zip(tiles, gallery):
-        # dst= needs an exact shape and dtype match or cv2 quietly drops the write.
-        cv2.resize(img, (cell_w, cell_h), dst=tile)
+        fit_to_cell(img, cell_size, fit, dst=tile)
     return tiles
 
 
@@ -136,6 +198,9 @@ CIFAR_IMAGE_BYTES = 3072
 
 # What a directory gallery counts as a video.
 VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"})
+
+# Tiles to allocate room for when a video source can't say how many there'll be.
+FALLBACK_CAPACITY = 1024
 
 
 def read_cifar_batch(path: Path) -> Image:
@@ -164,28 +229,40 @@ class CifarGallery:
     def fingerprint(self) -> str:
         return f"cifar:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
 
+    @property
+    def native_aspect(self) -> tuple[int, int] | None:
+        return (1, 1)
+
     def estimate_count(self) -> int | None:
         # Labels and filenames pad the pickle, so this reads 1.1% high on the
         # real train batch (50537 against 50000). Fine for a budget.
         return self._path.stat().st_size // CIFAR_IMAGE_BYTES
 
-    def load(self, cell_size: tuple[int, int]) -> Image:
-        return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size)
+    def load(self, cell_size: tuple[int, int], fit: Fit = "native",
+             budget: int = HARD_BUDGET) -> Image:
+        # The pickle's count is known before any resizing, so nothing can grow
+        # past what the estimate already priced.
+        return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size, fit)
 
 
 class VideoGallery:
     """Tiles decoded from a video (or a directory of them), keeping every
-    `stride`-th frame. Not implemented yet — see plan 2.1."""
+    `stride`-th frame. See docs/video-gallery.md."""
 
     def __init__(self, path: Path, stride: int = 10):
         self._path = Path(path)
         self._stride = stride
+        self._count: int | None = None
+        self._counted = False
 
     def _files(self) -> list[Path]:
         """The videos this gallery reads, in a stable order."""
         if self._path.is_dir():
+            # Dotfiles are skipped for the AppleDouble `._name.mkv` stubs a rip
+            # off a Mac leaves behind: right suffix, 4 KB of resource fork.
             return sorted(p for p in self._path.iterdir()
-                          if p.suffix.lower() in VIDEO_SUFFIXES)
+                          if p.suffix.lower() in VIDEO_SUFFIXES
+                          and not p.name.startswith("."))
         return [self._path]
 
     @property
@@ -193,12 +270,41 @@ class VideoGallery:
         files = ",".join(f"{p.resolve()}:{p.stat().st_mtime_ns}" for p in self._files())
         return f"video:{files}:stride={self._stride}"
 
+    @property
+    def native_aspect(self) -> tuple[int, int] | None:
+        """The first file's frame shape, assumed to hold for the rest.
+
+        A season is one rip at one resolution; a mixed bag would need the cell
+        to fit them all, which no single ratio does.
+        """
+        files = self._files()
+        if not files:
+            return None
+        cap = cv2.VideoCapture(str(files[0]))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if width <= 0 or height <= 0:
+            return None
+        ratio = Fraction(width, height)
+        return (ratio.numerator, ratio.denominator)
+
     def estimate_count(self) -> int | None:
         """Frame count over stride, summed over the files. Upper bound.
 
         Container metadata, so it can lie — fine for a warning, never for
         sizing an allocation. Measured exact on the three rips to hand.
+
+        Memoised: three call sites per load, and each one opens every file in
+        the directory. A directory that changes mid-run gets a stale count,
+        which costs a resize at worst.
         """
+        if not self._counted:
+            self._count = self._scan_count()
+            self._counted = True
+        return self._count
+
+    def _scan_count(self) -> int | None:
         total = 0
         for path in self._files():
             cap = cv2.VideoCapture(str(path))
@@ -215,16 +321,87 @@ class VideoGallery:
             total += -(-int(frames) // self._stride)
         return total
 
-    def load(self, cell_size: tuple[int, int]) -> Image:
-        raise NotImplementedError("VideoGallery lands in phase 2.1")
+    def load(self, cell_size: tuple[int, int], fit: Fit = "native",
+             budget: int = HARD_BUDGET) -> Image:
+        """Decode every file in order, keeping one frame in `stride`, deduped.
+
+        Straight through, no seeking: frame-accurate seek on long-GOP video
+        costs more than decoding past the frames we don't want. `grab()` skips
+        the colour conversion for those, which is most of them.
+        """
+        cell_w, cell_h = cell_size
+        files = self._files()
+        if not files:
+            raise ValueError(f"No videos found at {self._path}")
+
+        tiles = np.empty((self.estimate_count() or FALLBACK_CAPACITY,
+                          cell_h, cell_w, 3), dtype=np.uint8)
+        seen: set[bytes] = set()
+        kept = sampled = 0
+
+        with tqdm.tqdm(desc="Decoding gallery...", unit="frame",
+                       total=self._frame_total()) as bar:
+            for path in files:
+                cap = cv2.VideoCapture(str(path))
+                if not cap.isOpened():
+                    raise ValueError(f"Video at {path} could not be opened!")
+
+                index = 0
+                while cap.grab():
+                    if index % self._stride == 0:
+                        ok, frame = cap.retrieve()
+                        if ok:
+                            if kept == len(tiles):
+                                # The estimate was low, so re-price before
+                                # doubling — nothing else stands between a
+                                # lying container and an OOM. np.resize holds
+                                # both buffers over the copy, so the moment
+                                # costs half again on top.
+                                grown = 2 * len(tiles)
+                                enforce_gallery_budget(grown, cell_size, budget)
+                                tiles = np.resize(tiles, (grown, cell_h,
+                                                          cell_w, 3))
+                            # Written straight into its slot, then kept or not:
+                            # a scratch tile per frame would be the only copy.
+                            # cv2's stubs won't commit to a dtype; decode is uint8.
+                            fit_to_cell(cast(Image, frame), cell_size, fit,
+                                        dst=tiles[kept])
+                            digest = hashlib.blake2b(tiles[kept].tobytes(),
+                                                     digest_size=8).digest()
+                            sampled += 1
+                            if digest not in seen:
+                                seen.add(digest)
+                                kept += 1
+                    index += 1
+                    bar.update()
+                cap.release()
+
+        print(f"Sampled {sampled} frames from {len(files)} file(s) -> "
+              f"{kept} tiles ({sampled - kept} duplicates dropped)")
+        # A slice would pin the whole buffer, and dedupe can leave most of it
+        # empty. Copying costs a moment's double-hold to give the rest back.
+        return tiles[:kept].copy() if kept < 0.9 * len(tiles) else tiles[:kept]
+
+    def _frame_total(self) -> int | None:
+        """Frames to be decoded, for the progress bar. Metadata, so a hint only."""
+        count = self.estimate_count()
+        return count * self._stride if count else None
 
 
 DEFAULT_CACHE_DIR = Path(".cache/gallery")
 
 
-def cache_key(source: GallerySource, cell_size: tuple[int, int]) -> str:
+# Bump when the pixels a given (source, cell, fit) produces change — v2 is the
+# INTER_AREA switch in `fit_to_cell()`. Nothing in the key covers resampling,
+# so without this a stale cache serves the old tiles forever.
+TILE_VERSION = 2
+
+
+def cache_key(source: GallerySource, cell_size: tuple[int, int],
+              fit: Fit = "native") -> str:
     """Filename-safe digest of everything that determines the loaded tiles."""
-    material = f"{source.fingerprint}|cell={cell_size[0]}x{cell_size[1]}"
+    material = (f"{source.fingerprint}|cell={cell_size[0]}x{cell_size[1]}"
+                f"|fit={fit}|v={TILE_VERSION}")
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
@@ -238,6 +415,24 @@ def format_bytes(size: float) -> str:
             return f"{size:.3g} {unit}"
         size /= 1024
     return f"{size:.3g} TB"
+
+
+def enforce_gallery_budget(count: int, cell_size: tuple[int, int],
+                           budget: int = HARD_BUDGET) -> int:
+    """Price a tile array of `count` tiles, raising if it's over budget.
+
+    Called on the estimate up front, and again by a source that outgrows its
+    estimate mid-decode — the estimate is container metadata and metadata lies.
+    """
+    cell_w, cell_h = cell_size
+    size = count * cell_h * cell_w * 3
+    if size >= budget:
+        raise GalleryTooLarge(
+            f"Gallery needs ~{count} tiles x {cell_w}x{cell_h}x3 B = "
+            f"{format_bytes(size)}, over the {format_bytes(budget)} budget. "
+            f"Raise grid_size for a smaller cell, or stride for fewer tiles — "
+            f"or raise gallery_budget if you really do have the RAM.")
+    return size
 
 
 def check_gallery_budget(source: GallerySource, cell_size: tuple[int, int],
@@ -254,14 +449,9 @@ def check_gallery_budget(source: GallerySource, cell_size: tuple[int, int],
               f"Each tile is {cell_w}x{cell_h}x3 B.")
         return
 
-    size = count * cell_h * cell_w * 3
+    size = enforce_gallery_budget(count, cell_size, budget)
     arithmetic = (f"~{count} tiles x {cell_w}x{cell_h}x3 B = "
                   f"{format_bytes(size)}")
-    if size >= budget:
-        raise GalleryTooLarge(
-            f"Gallery needs {arithmetic}, over the {format_bytes(budget)} budget. "
-            f"Raise grid_size for a smaller cell, or stride for fewer tiles — "
-            f"or raise gallery_budget if you really do have the RAM.")
     if size >= SOFT_BUDGET:
         print(f"WARNING: gallery is {arithmetic}, all of it held in RAM. "
               f"Raise grid_size for a smaller cell, or stride for fewer tiles.")
@@ -270,6 +460,7 @@ def check_gallery_budget(source: GallerySource, cell_size: tuple[int, int],
 
 
 def load_gallery(source: GallerySource, derived: DerivedConfig, *,
+                 fit: Fit = "native",
                  cache_dir: Path = DEFAULT_CACHE_DIR,
                  use_cache: bool = True,
                  budget: int = HARD_BUDGET) -> Image:
@@ -279,7 +470,7 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
     See docs/gallery-cache.md.
     """
     cell_size = derived.cell_size
-    path = cache_dir / f"tiles-{cache_key(source, cell_size)}.npy"
+    path = cache_dir / f"tiles-{cache_key(source, cell_size, fit)}.npy"
     if use_cache and path.exists():
         tiles: Image = np.load(path)
         # A truncated or hand-edited file isn't worth trusting over a re-decode.
@@ -290,7 +481,7 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
 
     # Only worth estimating on the path that decodes; a cache hit knows the truth.
     check_gallery_budget(source, cell_size, budget)
-    tiles = source.load(cell_size)
+    tiles = source.load(cell_size, fit, budget)
     if not use_cache:
         return tiles
 
@@ -316,7 +507,8 @@ def gallery_brightness(gallery: Image) -> Brightness:
     return brightness
 
 
-def probe_video(config: UserConfig) -> DerivedConfig:
+def probe_video(config: UserConfig,
+                tile_aspect: tuple[int, int] | None = None) -> DerivedConfig:
     """Read source video metadata and derive the grid, cell and target size."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
@@ -330,7 +522,8 @@ def probe_video(config: UserConfig) -> DerivedConfig:
     cap.release()
 
     derived = DerivedConfig.from_source(config, fps=fps, dimensions=dimensions,
-                                        frame_count=frame_count)
+                                        frame_count=frame_count,
+                                        tile_aspect=tile_aspect)
 
     print(f"Source: {derived.src_dimensions}, Target: {derived.target_dimensions}, "
           f"Grid: {derived.grid_x}x{derived.grid_y}, Cell: {derived.cell_size}")
@@ -580,12 +773,16 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probe first: the gallery can't load until the cell size is known.
-    derived = probe_video(config)
+    # Probe first: the gallery can't load until the cell size is known. Under
+    # `native` the cell shape is the gallery's, which is cheap metadata.
+    tile_aspect = (gallery_source.native_aspect
+                   if config.tile_fit == "native" else None)
+    derived = probe_video(config, tile_aspect)
     # Handed straight over: a local pinning the tiles would keep the whole array
     # alive beside the metric's own copy for the rest of the run.
     metric = build_metric(
-        load_gallery(gallery_source, derived, budget=config.gallery_budget),
+        load_gallery(gallery_source, derived, fit=config.tile_fit,
+                     budget=config.gallery_budget),
         config, derived)
 
     frames = stream_frames(config, derived)
@@ -601,6 +798,9 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
 
 
 if __name__ == "__main__":
+    # Swap for VideoGallery(Path("./assets/videos"), stride=10) to build the
+    # tiles out of your own videos instead. CIFAR is what docs/ tells you to
+    # download, so it's what a clean checkout can actually run.
     main(CifarGallery(Path("./assets/gallery/train")),
          UserConfig(input_dir="./assets/source.mp4",
                     output_dir="./output/",

@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import pytest
 
 from conftest import CELL
 from main import (CifarGallery, GallerySource, UserConfig, VideoGallery,
@@ -51,11 +50,6 @@ def test_gallery_sources_satisfy_the_protocol(tmp_path):
 
     assert callable(takes_a_source(CifarGallery(tmp_path / "train")).load)
     assert callable(takes_a_source(VideoGallery(tmp_path / "gallery.mkv")).load)
-
-
-def test_video_gallery_is_not_implemented_yet(tmp_path):
-    with pytest.raises(NotImplementedError):
-        VideoGallery(tmp_path / "gallery.mkv", stride=10).load(CELL)
 
 
 def test_gallery_brightness_matches_cvtcolor(cell_gallery):

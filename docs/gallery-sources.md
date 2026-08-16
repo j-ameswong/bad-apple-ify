@@ -23,6 +23,14 @@ everything that changes the tiles (the files read, their mtimes, any sampling
 parameters) and nothing that doesn't. The [tile cache](gallery-cache.md) keys on
 it, so a source that under-reports here will happily serve stale tiles.
 
+## The shape of a tile
+
+`native_aspect` is the ratio the source's own images are shaped to — `(1, 1)`
+for CIFAR, the frame shape for a video, `None` if the source can't say. Under
+`tile_fit="native"` the cell is shaped to it, so tiles are never distorted; the
+`fit` argument to `load()` covers the cases where a cell and an image still
+don't agree. See [tile shape](tile-shape.md).
+
 ## The estimate
 
 `estimate_count()` is a cheap, deliberately rough guess at how many tiles
@@ -42,5 +50,6 @@ nothing to fix from this side short of re-serialising the file, so the warning
 is suppressed. And the RGB→BGR flip produces a reverse-strided view, which cv2
 refuses later, hence the `ascontiguousarray`.
 
-`VideoGallery` decodes a video (or a directory of them) keeping every
-`stride`-th frame. Stubbed until plan phase 2.1.
+`VideoGallery` decodes a video, or a directory of them, keeping every
+`stride`-th frame and deduping what comes back. See
+[video galleries](video-gallery.md).

@@ -6,6 +6,7 @@ output/*
 */output/
 *.png
 assets/gallery/*
+assets/videos/
 !assets/*.mp4
 *.mp4
 __pycache__

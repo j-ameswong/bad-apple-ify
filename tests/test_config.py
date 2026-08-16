@@ -12,10 +12,10 @@ import pytest
 from main import DerivedConfig, UserConfig
 
 
-def derive(width: int, height: int, **kwargs) -> DerivedConfig:
+def derive(width: int, height: int, tile_aspect=None, **kwargs) -> DerivedConfig:
     config = UserConfig(input_dir="", output_dir="", **kwargs)
     return DerivedConfig.from_source(config, fps=30, dimensions=(width, height),
-                                     frame_count=10)
+                                     frame_count=10, tile_aspect=tile_aspect)
 
 
 def test_user_config_is_frozen():
@@ -97,6 +97,69 @@ def test_single_frame_cell_keeps_the_source_shape():
     derived = derive(478, 200, grid_size=1)
 
     assert derived.cell_size == (478, 200)
+
+
+def test_native_tiles_shape_the_cell():
+    """2.1: 16:9 tiles get a 16:9-ish cell instead of being squashed square."""
+    derived = derive(512, 384, grid_size=8, tile_aspect=(16, 9))
+
+    cell_w, cell_h = derived.cell_size
+    assert cell_w / cell_h == pytest.approx(16 / 9, rel=0.05)
+    # Rows are untouched — it's the columns that give way.
+    assert derived.grid_y == derive(512, 384, grid_size=8).grid_y
+    assert derived.grid_x < derive(512, 384, grid_size=8).grid_x
+
+
+def test_native_tiles_keep_the_frame_shape():
+    """The tiles absorb the rounding, so the mosaic still looks like the source."""
+    derived = derive(512, 384, grid_size=8, tile_aspect=(16, 9))
+
+    width, height = derived.target_dimensions
+    assert width / height == pytest.approx(512 / 384, rel=0.05)
+
+
+def test_native_tiles_keep_the_frame_shape_when_the_rows_round():
+    """1080p at grid_size=16 snaps 1080 to 1152, and the columns must follow.
+
+    Deriving the columns off the raw 1920 instead put the mosaic at 1.64:1
+    against a 1.78:1 source, an 8% vertical squash the 512x384 cases can't see
+    (384/24 divides exactly, so there's nothing to round).
+    """
+    derived = derive(1920, 1080, grid_size=16, tile_aspect=(16, 9))
+
+    width, height = derived.target_dimensions
+    assert width / height == pytest.approx(1920 / 1080, rel=0.02)
+
+
+def test_square_tiles_change_nothing():
+    """CIFAR is 1:1, so `native` has to land exactly where the old derivation did.
+
+    True where the source's own cells came out square, which 512x384 does.
+    Elsewhere square tiles force a square cell the base grid never had — see
+    `test_square_tiles_still_square_the_cell`.
+    """
+    assert derive(512, 384, grid_size=8, tile_aspect=(1, 1)) == derive(512, 384,
+                                                                      grid_size=8)
+
+
+def test_square_tiles_still_square_the_cell():
+    """2.39:1 at grid_size=8 gives a 2x2 cell either way, so nothing moves.
+
+    Pinned because `native` reshapes the cell whatever the tiles are, so a
+    square gallery is only a no-op by arithmetic, not by construction.
+    """
+    native = derive(478, 200, grid_size=8, tile_aspect=(1, 1))
+
+    assert native.cell_size[0] == native.cell_size[1]
+    assert native.target_dimensions[0] / native.target_dimensions[1] == \
+        pytest.approx(478 / 200, rel=0.05)
+
+
+def test_native_tiles_do_not_touch_single_frame_mode():
+    """The one cell is the whole frame; the tile fits into it, not the reverse."""
+    derived = derive(512, 384, grid_size=1, tile_aspect=(16, 9))
+
+    assert derived.cell_size == (512, 384)
 
 
 def test_derivation_is_a_pure_function_of_its_inputs():

@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from conftest import CELL
-from main import CifarGallery, DerivedConfig, cache_key, load_gallery
+from main import (CifarGallery, DerivedConfig, HARD_BUDGET, cache_key,
+                  load_gallery)
 
 
 class CountingSource:
@@ -23,10 +24,15 @@ class CountingSource:
     def fingerprint(self) -> str:
         return self._fingerprint
 
+    @property
+    def native_aspect(self) -> tuple[int, int] | None:
+        return (1, 1)
+
     def estimate_count(self) -> int:
         return len(self._tiles)
 
-    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+    def load(self, cell_size: tuple[int, int], fit: str = "native",
+             budget: int = HARD_BUDGET) -> np.ndarray:
         self.loads += 1
         cell_w, cell_h = cell_size
         return np.broadcast_to(self._tiles[:, :1, :1],

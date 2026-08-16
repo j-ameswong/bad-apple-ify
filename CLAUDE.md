@@ -13,7 +13,9 @@ uv sync          # install dependencies
 uv run main.py   # run the pipeline
 ```
 
-Requires `ffmpeg` on PATH and the CIFAR-100 `train` pickle file at `./assets/gallery/train`.
+Requires `ffmpeg` on PATH. The gallery is whatever `GallerySource` `__main__`
+passes: `VideoGallery(Path("./assets/videos"))` for a directory of videos, or
+`CifarGallery(Path("./assets/gallery/train"))` for the CIFAR-100 pickle.
 
 ## Testing
 
@@ -50,6 +52,13 @@ User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
   the cell simply becomes the frame. Note the memory cost: tiles are stored at
   cell size, so a full-frame cell means the whole gallery is held at output
   resolution (CIFAR at 512×384 is ~29 GB). Use a small gallery for this mode.
+- `tile_fit` — `native` (default), `crop` or `stretch`. Under `native` the cell
+  takes the gallery's own aspect ratio, so tiles are whole undistorted frames and
+  the grid gives way (Bad Apple at `grid_size=8` against 16:9 tiles: 18x24 of
+  28x16, not 32x24 of 16x16). `crop` and `stretch` keep the square-ish grid and
+  fit the image into it. On a square gallery like CIFAR the three usually agree,
+  but only by arithmetic — `native` reshapes the cell whatever the tiles are.
+  See `docs/tile-shape.md`
 - `contrast` — fraction of gallery brightness range to use (0–1); lower trims extremes for "cooler" results
 - `candidates` — how many tiles each cell picks between; the variety knob, and gallery-independent (`1` pins every cell to its single closest tile)
 - `epsilon` — accuracy ceiling: max brightness error (0–1) a candidate may have. Caps `candidates` on a sparse gallery rather than letting it reach for tonally wrong tiles
@@ -71,8 +80,8 @@ the *why* there instead.
 
 The entire pipeline is single-file (`main.py`):
 
-1. **`probe_video()`** — reads source metadata (FPS, dimensions) and returns a `DerivedConfig`, which derives an integer aspect pair from the source's own ratio (`Fraction(...).limit_denominator(16)`) and snaps target dimensions to the nearest grid multiple (`grid_size=1` is the exception: the grid is 1×1 and the cell is the whole frame); **`stream_frames()`** then yields frames one at a time (never the whole video in RAM). Runs **first**, because the gallery cannot be loaded until the cell size is known
-2. **`GallerySource`** — protocol for tile sources: `load(cell_size)` returns `(N, cell_h, cell_w, 3)` BGR tiles **already at cell size**, `fingerprint` identifies what `load()` will return (files read, their mtimes, sampling parameters), and `estimate_count()` guesses the tile count cheaply (`None` if it can't). Full-resolution gallery frames are never stored (a season of anime at 1080p is 257 GB; at 16×16 it is 32 MB), so the protocol never promises them. `CifarGallery(path)` wraps the CIFAR-100 pickle (`read_cifar_batch()` + `resize_gallery_to_cells()`); `VideoGallery(path, stride)` is stubbed until phase 2.1
+1. **`probe_video()`** — reads source metadata (FPS, dimensions) plus the gallery's `native_aspect` and returns a `DerivedConfig`, which derives an integer aspect pair from the source's own ratio (`Fraction(...).limit_denominator(16)`) and snaps target dimensions to the nearest grid multiple (`grid_size=1` is the exception: the grid is 1×1 and the cell is the whole frame); **`stream_frames()`** then yields frames one at a time (never the whole video in RAM). Runs **first**, because the gallery cannot be loaded until the cell size is known
+2. **`GallerySource`** — protocol for tile sources: `load(cell_size)` returns `(N, cell_h, cell_w, 3)` BGR tiles **already at cell size**, `fingerprint` identifies what `load()` will return (files read, their mtimes, sampling parameters), and `estimate_count()` guesses the tile count cheaply (`None` if it can't). Full-resolution gallery frames are never stored (a season of anime at 1080p is 257 GB; at 16×16 it is 32 MB), so the protocol never promises them. `native_aspect` reports the ratio the source's own images are shaped to, which is what `tile_fit="native"` shapes the cell to. `CifarGallery(path)` wraps the CIFAR-100 pickle (`read_cifar_batch()` + `resize_gallery_to_cells()`); `VideoGallery(path, stride)` decodes a video or a directory of them, keeping every `stride`-th frame, downscaling it as it goes and dropping duplicate tiles (`docs/video-gallery.md`)
 3. **`load_gallery()`** — calls `source.load()` through an on-disk cache of `.npy` tile arrays under `.cache/gallery/`, keyed by `cache_key()` = sha256 of `(fingerprint, cell size)`. A hit skips the decode entirely (and the size estimate — it knows the real answer); writes go via a temp file and rename. `use_cache=False` bypasses the cache but not `check_gallery_budget()`. Metric precompute is *not* cached — it is ~10 ms against a 38 MB read
 4. **`gallery_brightness()`** — precomputes per-tile brightness scalars (0–1)
 5. **`shrink_gallery()`** — filters gallery to a percentile band around 50% brightness, controlled by `config.contrast`

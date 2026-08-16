@@ -33,6 +33,13 @@ Watch the memory. Tiles are stored at cell size, so a full-frame cell means the
 whole gallery is held at output resolution. CIFAR at 512x384 is about 29 GB.
 Use a small gallery in this mode.
 
+## Native tiles reshape the grid
+
+`tile_fit="native"` hands `from_source()` the gallery's own aspect ratio, and
+the cell is shaped to that instead of coming out square. Rows are untouched; the
+columns are recounted around the new cell width. The full argument, including
+which of the two roundings gives way, is in [tile shape](tile-shape.md).
+
 ## Target dimensions snap to the grid
 
 The cell size is the source dimension divided by the grid, rounded, floored at

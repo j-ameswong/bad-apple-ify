@@ -394,6 +394,30 @@ duplicates — on animation this plausibly halves the gallery for free, and it
 directly improves 0.4 (a deduped gallery has more genuine variety per
 brightness bucket).
 
+**Landed.** `VideoGallery.load()` decodes straight through with
+`grab()`/`retrieve()`, fills a pre-sized buffer in place, and hashes each
+downscaled tile to drop duplicates. Notes in `docs/video-gallery.md`, tests in
+`tests/test_video_gallery.py`.
+
+**Measured**, one Lucky Star episode (1080p HEVC-10bit): 41,647 frames in 73s,
+~570 fps — so a 27-file season is about half an hour, once, behind the cache.
+`CAP_PROP_FRAME_COUNT` read 42,590 against that, 2.3% high, so the estimate
+stays the upper bound the budget check needs.
+
+Dedupe earned far less than this plan hoped: **6 duplicates out of 4,165 tiles**
+at stride 10, not the halving predicted above. Held cels last two or three
+frames, so a stride of 10 almost never lands on the same one twice. It's worth
+keeping for fades and for small strides; it is not a way to halve a sampled
+gallery, and 0.4 gets nothing from it.
+
+**Non-square cells went further than `--tile-fit crop|stretch`.** Cropping 16:9
+down to a square throws away 44% of the frame's width, so `tile_fit` has a third
+mode, `native`, which is the default: the *cell* takes the tiles' ratio and the
+grid gives way. Bad Apple at `grid_size=8` becomes an 18x24 grid of 28x16 cells
+instead of 32x24 of 16x16, and every tile is a whole undistorted frame. That
+needed `native_aspect` on the `GallerySource` protocol — cheap metadata, read
+before the probe. See `docs/tile-shape.md`.
+
 **Testable when:** Given a known video, `VideoGallery.load(cell_size)` returns an
 array whose length equals the number of frames actually kept at that stride,
 each already at cell size. Each sampled frame matches the corresponding frame

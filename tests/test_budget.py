@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 
 from conftest import CELL, make_frames, write_video
-from main import (CifarGallery, DerivedConfig, GalleryTooLarge, VideoGallery,
-                  check_gallery_budget, format_bytes, load_gallery)
+from main import (CifarGallery, DerivedConfig, GalleryTooLarge, HARD_BUDGET,
+                  VideoGallery, check_gallery_budget, format_bytes,
+                  load_gallery)
 
 
 class ExplodingSource:
@@ -26,17 +27,23 @@ class ExplodingSource:
     def fingerprint(self) -> str:
         return self._fingerprint
 
+    @property
+    def native_aspect(self) -> tuple[int, int] | None:
+        return (1, 1)
+
     def estimate_count(self) -> int | None:
         return self._count
 
-    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+    def load(self, cell_size: tuple[int, int], fit: str = "native",
+             budget: int = HARD_BUDGET) -> np.ndarray:
         raise AssertionError("load() was entered despite the budget check")
 
 
 class TinySource(ExplodingSource):
     """Same, but it will actually hand over a (count, cell) array."""
 
-    def load(self, cell_size: tuple[int, int]) -> np.ndarray:
+    def load(self, cell_size: tuple[int, int], fit: str = "native",
+             budget: int = HARD_BUDGET) -> np.ndarray:
         cell_w, cell_h = cell_size
         return np.zeros((self._count, cell_h, cell_w, 3), dtype=np.uint8)
 
@@ -88,6 +95,42 @@ def test_video_estimate_is_none_when_nothing_can_be_read(tmp_path):
     (tmp_path / "broken.mkv").write_bytes(b"not a video at all")
 
     assert VideoGallery(tmp_path / "broken.mkv").estimate_count() is None
+
+
+def test_a_lying_estimate_is_caught_on_the_way_up(tmp_path, monkeypatch):
+    """The estimate is container metadata, so the growth path re-prices.
+
+    Otherwise a file that under-reports its frame count sails past the budget
+    that was checked, doubling its way to an OOM.
+    """
+    path = tmp_path / "gallery.mkv"
+    write_video(path, make_frames(20, 16, 16))
+    source = VideoGallery(path, stride=1)
+    monkeypatch.setattr(source, "estimate_count", lambda: 1)
+
+    # One 4x4 tile is 48 B, so a budget of 96 B stops the first doubling.
+    with pytest.raises(GalleryTooLarge):
+        source.load(CELL, "stretch", budget=96)
+
+
+def test_the_estimate_is_only_scanned_once(tmp_path):
+    """Three call sites per load, each opening every file in the directory."""
+    for i in range(3):
+        write_video(tmp_path / f"ep{i}.mkv", make_frames(10, 16, 16))
+    source = VideoGallery(tmp_path, stride=5)
+
+    scans = 0
+    original = source._scan_count
+
+    def counting_scan() -> int | None:
+        nonlocal scans
+        scans += 1
+        return original()
+
+    setattr(source, "_scan_count", counting_scan)
+    source.load(CELL, "stretch")
+
+    assert scans == 1
 
 
 # --- acting on the estimate -------------------------------------------------
