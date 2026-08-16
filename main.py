@@ -534,17 +534,21 @@ def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
 
 
 def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
-                   dimensions: tuple[int, int]) -> Path:
+                   dimensions: tuple[int, int],
+                   total_frames: int = 0) -> Path:
     """Stack the source and its mosaic side by side into one video.
 
     `hstack` wants both inputs at the same height, and target dimensions are
     snapped to a grid multiple, so the source gets scaled rather than trusted
     to match.
+
+    `-progress pipe:1` makes ffmpeg emit `key=value` lines on stdout as it goes;
+    the `frame=` ones drive the bar.
     """
-    print("Combining source and mosaic side by side...")
     width, height = dimensions
-    subprocess.run([
+    proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+        "-progress", "pipe:1",
         "-i", str(source_path),
         "-i", str(mosaic_path),
         "-filter_complex",
@@ -553,7 +557,21 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
         "-y", str(output_path)
-    ], check=True, stdin=subprocess.DEVNULL)
+    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+    # Only ever None when stdout=PIPE wasn't asked for, which it was.
+    assert proc.stdout is not None
+
+    with tqdm.tqdm(desc="Combining videos...", total=total_frames or None,
+                   unit="frame") as bar:
+        for line in proc.stdout:
+            key, _, value = line.partition("=")
+            if key == "frame":
+                # It's a running total, not a delta.
+                bar.update(int(value) - bar.n)
+    proc.wait()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg combine failed with exit code {proc.returncode}")
     return output_path
 
 
@@ -576,8 +594,9 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
 
     combined = combine_videos(Path(config.input_dir), mosaic_path,
                               output_dir / "combined.mp4",
-                              derived.target_dimensions)
-    print(f"Done. Output written to {output_dir}")
+                              derived.target_dimensions,
+                              derived.src_frame_count)
+    print(f"Done. Output written to ./{output_dir}/")
     return combined
 
 
