@@ -344,7 +344,26 @@ produces a verifiable output without side effects on the others.
 Add full PEP 484 annotations to every function signature. No `Any`, no bare
 `tuple` — use `tuple[int, int]` etc.
 
-**Testable when:** `mypy --strict main.py` passes with no errors.
+**Landed.** The signatures were mostly there already; what `--strict` actually
+caught was `np.ndarray` itself. A bare one is `ndarray[Any, dtype[Any]]`, so
+every array in the pipeline was untyped in the way that matters — nothing
+stopped a brightness array being passed where tiles were expected. Three
+aliases now say which is which:
+
+```python
+type Image = npt.NDArray[np.uint8]        # frames, tiles, galleries
+type Brightness = npt.NDArray[np.float64] # 0-1 scalars, one per tile
+type Indices = npt.NDArray[np.int64]      # what match() returns
+```
+
+The rest was four `np.load`/`@`/fancy-index results coming back as `Any`
+(annotated at the binding), one `cv2.resize` whose stub won't commit to a dtype
+(cast), and `proc.stdin` being `IO[bytes] | None` when `stdin=PIPE` guarantees
+it isn't (assert). `strict = true` and `files = ["main.py"]` live in
+`pyproject.toml`, so `uv run mypy` bare is the check. Tests are out of scope —
+97 of the 107 errors there are `-> None` on test functions.
+
+**Testable when:** `mypy --strict main.py` passes with no errors. ✅ — `uv run mypy`.
 
 ---
 

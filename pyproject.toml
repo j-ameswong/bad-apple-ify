@@ -11,13 +11,21 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "mypy>=2.3.1",
     "pytest>=8.4.0",
+    "types-tqdm>=4.70.0.20260805",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # main.py lives at the repo root, not in a package.
 pythonpath = ["."]
+
+[tool.mypy]
+# `uv run mypy` with no arguments checks the pipeline. The tests aren't in
+# scope — they'd be 97 mechanical `-> None`s for nothing.
+files = ["main.py"]
+strict = true
 
 [tool.pyright]
 venvPath = "."

@@ -26,6 +26,17 @@ generate a synthetic FFV1/mkv video (lossless, so tests can assert on exact
 pixels) and a 100-image fake gallery, plus a CIFAR-format pickle built from it.
 Neither `assets/source.mp4` nor the 155 MB CIFAR pickle is needed.
 
+## Type checking
+
+```bash
+uv run mypy
+```
+
+Config is in `pyproject.toml`: `strict = true` over `main.py` only, so the bare
+command is the check. Arrays go through the `Image` / `Brightness` / `Indices`
+aliases at the top of `main.py` rather than `np.ndarray`, which under strict is
+`ndarray[Any, dtype[Any]]` and tells you nothing. The tests aren't checked.
+
 ## Configuration
 
 User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
