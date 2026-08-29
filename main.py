@@ -20,6 +20,9 @@ type Indices = npt.NDArray[np.int64]
 # How a gallery image fills a cell it doesn't share a shape with.
 type Fit = Literal["native", "crop", "stretch"]
 
+# Which `Metric` a run matches with.
+type MetricName = Literal["brightness", "colour"]
+
 # Rec.601 luma weights in BGR order — what cv2.COLOR_BGR2GRAY applies.
 LUMA_BGR = np.array([0.114, 0.587, 0.299])
 
@@ -37,8 +40,10 @@ class UserConfig:
     contrast: float = 0.1
     grid_size: int = 16  # multiplier for aspect ratio
     tile_fit: Fit = "native"  # cell takes the tiles' own ratio, or crop/stretch into it
-    candidates: int = 256  # tiles to sample from per brightness level
-    epsilon: float = 0.005  # max brightness error (0-1) a candidate may have
+    metric: MetricName = "colour"  # what a cell matches on
+    candidates: int = 256  # tiles to sample from per bucket
+    epsilon: float = 0.005  # brightness only: max error (0-1) a candidate may have
+    colour_bins: int = 32  # colour only: lattice edge, so bins^3 buckets
     seed: int = 0
     gallery_budget: int = HARD_BUDGET  # bytes of tiles to refuse past
 
@@ -546,6 +551,83 @@ def stream_frames(config: UserConfig, derived: DerivedConfig) -> Iterator[Image]
     cap.release()
 
 
+class Metric(Protocol):
+    """How a grid cell picks its tile.
+
+    Grid-wise, not cell-wise: a per-cell `score()` would put back the Python
+    loop that vectorising `mosaic_frame()` took out.
+    """
+
+    def precompute(self, gallery: Image, cell_size: tuple[int, int],
+                   brightness: Brightness | None = None) -> None:
+        """Build the lookup and keep the tiles it can reach.
+
+        `brightness` is the caller's leftover from `shrink_gallery()`, offered
+        so nothing recomputes it; a metric with no use for it ignores it.
+        """
+        ...
+
+    def match(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of indices into `tiles`."""
+        ...
+
+    @property
+    def tiles(self) -> Image:
+        """(U, cell_h, cell_w, 3) tiles at cell size, indexed by `match()`."""
+        ...
+
+    @property
+    def bucket_size(self) -> float:
+        """Median tiles a cell picks between — what `candidates` actually bought."""
+        ...
+
+
+def check_cell_size(gallery: Image, cell_size: tuple[int, int]) -> None:
+    """Tiles arrive at cell size; unchecked, a mismatch surfaces much later as a
+    misshapen mosaic."""
+    cell_w, cell_h = cell_size
+    if gallery.shape[1:3] != (cell_h, cell_w):
+        raise ValueError(f"gallery tiles are {gallery.shape[2]}x{gallery.shape[1]}, "
+                         f"expected cell size {cell_w}x{cell_h}")
+    if len(gallery) == 0:
+        raise ValueError("gallery is empty, nothing to match against")
+
+
+def cell_means(image: Image, cell_size: tuple[int, int]) -> npt.NDArray[np.float64]:
+    """Per-cell mean of every channel: (H, W, ...) -> (grid_y, grid_x, ...).
+
+    A reshape, so it's the exact mean — `cv2.resize(..., INTER_AREA)` is the
+    same operation to within 0.5/255 if you ever need the speed instead.
+
+    The two axes come off one at a time because a single `.mean(axis=(1, 3))`
+    over a strided uint8 block costs 10x as much (2.7 ms a frame against 0.26 at
+    512x384), and integers summed in uint32 make it the identical answer.
+    """
+    cell_w, cell_h = cell_size
+    h, w = image.shape[:2]
+    block = image.reshape(h // cell_h, cell_h, w // cell_w, cell_w,
+                          *image.shape[2:])
+    totals = block.sum(axis=1, dtype=np.uint32).sum(axis=2)
+    means: npt.NDArray[np.float64] = totals / (cell_h * cell_w)
+    return means
+
+
+def compact_buckets(lo: Indices, count: Indices, n: int) -> tuple[Indices, Indices]:
+    """Which of `n` sorted tiles some bucket reaches, and where each one lands.
+
+    Coverage of the `[lo, lo + count)` spans, counted with a difference array.
+    Returns the reachable positions and a map from sorted position to its index
+    in the compacted tile array, so `match()` can index `tiles` directly.
+    """
+    spans = np.zeros(n + 1, dtype=np.int64)
+    np.add.at(spans, lo, 1)
+    np.add.at(spans, lo + count, -1)
+    reachable = np.flatnonzero(np.cumsum(spans)[:n] > 0)
+    remap = np.zeros(n, dtype=np.int64)
+    remap[reachable] = np.arange(len(reachable))
+    return reachable, remap
+
+
 class BrightnessMetric:
     """Match each cell to a gallery image of near-identical average brightness.
 
@@ -562,13 +644,7 @@ class BrightnessMetric:
 
     def precompute(self, gallery: Image, cell_size: tuple[int, int],
                    brightness: Brightness | None = None) -> None:
-        # Tiles arrive at cell size; unchecked, a mismatch surfaces much later
-        # as a misshapen mosaic.
-        cell_w, cell_h = cell_size
-        if gallery.shape[1:3] != (cell_h, cell_w):
-            raise ValueError(f"gallery tiles are {gallery.shape[2]}x{gallery.shape[1]}, "
-                             f"expected cell size {cell_w}x{cell_h}")
-
+        check_cell_size(gallery, cell_size)
         bright = gallery_brightness(gallery) if brightness is None else brightness
         order = np.argsort(bright)
         sorted_bright = bright[order]
@@ -602,28 +678,16 @@ class BrightnessMetric:
                 end = begin + 1
             lo[i], count[i] = begin, end - begin
 
-        # Compact the gallery to the images some bucket can actually reach,
-        # counting span coverage with a difference array.
-        spans = np.zeros(n + 1, dtype=np.int64)
-        np.add.at(spans, lo, 1)
-        np.add.at(spans, lo + count, -1)
-        reachable = np.flatnonzero(np.cumsum(spans)[:n] > 0)
-        self._remap = np.zeros(n, dtype=np.int64)
-        self._remap[reachable] = np.arange(len(reachable))
-
+        reachable, self._remap = compact_buckets(lo, count, n)
         self._lo, self._count = lo, count
         self._tiles = gallery[order[reachable]]
         self._cell_w, self._cell_h = cell_size
 
     def match(self, frame: Image) -> Indices:
         """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
-        grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        grid_y = grey.shape[0] // self._cell_h
-        grid_x = grey.shape[1] // self._cell_w
-
-        cell_means = grey.reshape(grid_y, self._cell_h,
-                                  grid_x, self._cell_w).mean(axis=(1, 3))
-        levels = np.rint(cell_means).astype(np.uint8)
+        grey = cast(Image, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        means = cell_means(grey, (self._cell_w, self._cell_h))
+        levels = np.rint(means).astype(np.uint8)
 
         lo = self._lo[levels]
         picks = lo + self._rng.integers(self._count[levels])
@@ -642,7 +706,106 @@ class BrightnessMetric:
         return self._tiles
 
 
-def mosaic_frame(frame: Image, metric: BrightnessMetric) -> Image:
+def nearest_occupied(occupied: npt.NDArray[np.bool_], bins: int) -> Indices:
+    """For every cell of a bins^3 lattice, the index of the nearest occupied one.
+
+    A BFS wave over the six face neighbours, so "nearest" is Manhattan. Exact
+    Euclidean wants a KD-tree, which is a whole dependency for a tie-break
+    nobody can see in the output.
+    """
+    if not occupied.any():
+        raise ValueError("gallery has no tiles to match against")
+
+    donor = np.where(occupied, np.arange(bins ** 3), -1).reshape(bins, bins, bins)
+    while (empty := donor < 0).any():
+        # Donors from the previous wave only, so every cell takes the closest
+        # one rather than whichever direction happened to be checked last.
+        source = donor.copy()
+        for axis in range(3):
+            for shift in (1, -1):
+                near = np.roll(source, shift, axis=axis)
+                # roll wraps the lattice around; colour space doesn't.
+                edge = [slice(None)] * 3
+                edge[axis] = slice(0, 1) if shift == 1 else slice(bins - 1, bins)
+                near[tuple(edge)] = -1
+                fill = empty & (near >= 0)
+                donor[fill] = near[fill]
+                empty &= ~fill
+    indices: Indices = donor.reshape(-1)
+    return indices
+
+
+class ColourMetric:
+    """Match each cell to a gallery image of near-identical average colour.
+
+    Mean BGR quantised onto a `bins`^3 lattice. Every lattice cell holds the
+    tiles that landed in it, so a match is one lookup per grid cell — the same
+    O(1) as brightness, over three channels instead of one. Empty lattice cells
+    borrow the nearest occupied one. See docs/colour-matching.md.
+    """
+
+    def __init__(self, bins: int = 32, candidates: int = 1, seed: int = 0):
+        # The lattice is bins^3 cells and the fill walks it wave by wave, so the
+        # ceiling is about keeping precompute in milliseconds.
+        if not 2 <= bins <= 64:
+            raise ValueError(f"colour_bins must be between 2 and 64, got {bins}")
+        self._bins = bins
+        self._candidates = candidates
+        self._rng = np.random.default_rng(seed)
+
+    def precompute(self, gallery: Image, cell_size: tuple[int, int],
+                   brightness: Brightness | None = None) -> None:
+        # brightness is the caller's leftover from shrink_gallery(); colour
+        # matching has no use for it.
+        check_cell_size(gallery, cell_size)
+        bins = self._bins
+        keys = self._quantise(gallery.mean(axis=(1, 2)))
+        # Tiles sharing a lattice cell land contiguously, so a bucket is an
+        # offset and a count, same as a brightness bucket.
+        order = np.argsort(keys, kind="stable")
+        lo = np.searchsorted(keys[order], np.arange(bins ** 3))
+        # Everything in a lattice cell is equally acceptable by construction —
+        # the bin width *is* the tolerance — so the cap takes the first few.
+        held = np.minimum(np.bincount(keys, minlength=bins ** 3),
+                          max(self._candidates, 1))
+
+        donor = nearest_occupied(held > 0, bins)
+        self._lo, self._count = lo[donor], held[donor]
+        reachable, self._remap = compact_buckets(self._lo, self._count, len(gallery))
+        self._held = held
+        self._tiles = gallery[order[reachable]]
+        self._cell_w, self._cell_h = cell_size
+
+    def _quantise(self, colours: npt.NDArray[np.float64]) -> Indices:
+        """(..., 3) BGR in 0-255 -> (...) flat index into the lattice."""
+        q = np.clip((colours * self._bins / 256).astype(np.int64), 0, self._bins - 1)
+        flat: Indices = (q[..., 0] * self._bins + q[..., 1]) * self._bins + q[..., 2]
+        return flat
+
+    def match(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
+        keys = self._quantise(cell_means(frame, (self._cell_w, self._cell_h)))
+        picks = self._lo[keys] + self._rng.integers(self._count[keys])
+        indices: Indices = self._remap[picks]
+        return indices
+
+    @property
+    def bucket_size(self) -> float:
+        """Median candidates per occupied lattice cell.
+
+        Empty cells are left out: they're copies of a neighbour's bucket, and
+        counting them would just weight whichever colours are widespread.
+        """
+        real = self._held[self._held > 0]
+        return float(np.median(real)) if len(real) else 1.0
+
+    @property
+    def tiles(self) -> Image:
+        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
+        return self._tiles
+
+
+def mosaic_frame(frame: Image, metric: Metric) -> Image:
     """Build a mosaic for a single frame by matching each grid cell."""
     tiles = metric.tiles[metric.match(frame)]
     grid_y, grid_x, cell_h, cell_w, _ = tiles.shape
@@ -669,22 +832,27 @@ def shrink_gallery(gallery: Image, brightness: Brightness,
 
 
 def build_metric(gallery: Image, config: UserConfig,
-                 derived: DerivedConfig) -> BrightnessMetric:
+                 derived: DerivedConfig) -> Metric:
     """Trim the gallery and precompute the matcher over what survives."""
     brightness = gallery_brightness(gallery)
     # Rebinding drops the last reference to the loaded tiles, so precompute's
     # copy replaces them rather than joining them. See docs/gallery-size.md.
     gallery, brightness = shrink_gallery(gallery, brightness, config)
 
-    metric = BrightnessMetric(candidates=config.candidates,
-                              epsilon=config.epsilon, seed=config.seed)
+    metric: Metric
+    if config.metric == "colour":
+        metric = ColourMetric(bins=config.colour_bins,
+                              candidates=config.candidates, seed=config.seed)
+    else:
+        metric = BrightnessMetric(candidates=config.candidates,
+                                  epsilon=config.epsilon, seed=config.seed)
     metric.precompute(gallery, derived.cell_size, brightness)
     print(f"Gallery: {len(gallery)} images -> {len(metric.tiles)} usable tiles, "
           f"{metric.bucket_size:.0f} candidates per cell (median)")
     return metric
 
 
-def build_mosaics(frames: Iterator[Image], metric: BrightnessMetric,
+def build_mosaics(frames: Iterator[Image], metric: Metric,
                   derived: DerivedConfig) -> Iterator[Image]:
     """Turn a stream of source frames into a stream of mosaics.
 

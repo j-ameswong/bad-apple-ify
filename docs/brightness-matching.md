@@ -1,5 +1,9 @@
 # Brightness matching
 
+One of the two `Metric` implementations — see
+[colour-matching.md](colour-matching.md) for the protocol they share and for
+the colour one.
+
 `BrightnessMetric` matches each grid cell to a gallery image of near-identical
 average brightness. A cell's brightness rounds to one of 256 levels, so every
 possible match can be resolved once, at precompute time.

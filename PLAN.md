@@ -460,6 +460,31 @@ first `VideoGallery` run is worth looking at.
 `build_mosaics()` accepts a `Metric` instance and does nothing but
 `metric.tiles[metric.match(frame)]` + reshape.
 
+**Landed.** `Metric` protocol, `ColourMetric` on a `colour_bins`³ BGR lattice
+with a BFS fill for the empty cells, `metric` and `colour_bins` on `UserConfig`,
+`build_metric()` choosing between the two. Notes in `docs/colour-matching.md`,
+tests in `tests/test_colour_metric.py`.
+
+**Measured.** The priority note above is right about reach: against the real
+CIFAR batch at a 16x16 cell, brightness gets to 33,151 of the 50,000 images and
+colour to 49,954. Precompute is 0.17 s either way; a match is 0.28 ms/frame
+against brightness's 0.11, and both halved on the way — `cell_means()` reduces
+one axis at a time because a single `.mean(axis=(1, 3))` over a strided uint8
+block costs 10x as much for the identical answer.
+
+**`colour_bins` is a sharper knob than the plan implies.** It's the tolerance,
+so lowering it for variety goes wrong fast: at 8 a bucket spans 32 levels a
+channel and Bad Apple's black background fills with grey tiles, silhouette
+gone. 32 holds the shape. There is no `epsilon` for colour — the bin width is
+the epsilon, and `candidates` only caps how many of a bucket get sampled.
+
+**Colour is not a free win on a colour-poor gallery.** CIFAR has about two
+near-white images, so Bad Apple's whites repeat one tile however high
+`candidates` goes, where brightness had 256 near-white-in-luma images to draw
+on. That's the gallery, not the metric; a gallery of real video frames doesn't
+have the hole. Worth knowing before pointing it at CIFAR and concluding colour
+looks worse.
+
 **Testable when:** `BrightnessMetric` with stochastic selection disabled
 produces identical tile selections to the pre-refactor `mosaic_frame()` on the
 same input. `ColourMetric` produces different selections on a colourful source
@@ -629,8 +654,8 @@ nothing has to be unpicked once the target-scale constraints bite.
 10. 1.4 (type hints + mypy)
 11. 2.7 (`--start` / `--duration`) — pulled early; needed to iterate on anything
     feature-length without waiting out a full encode
-12. 2.2 (pluggable metric, incl. `ColourMetric`) — **before** 2.1, so the first
-    video-gallery run is actually worth looking at
+12. 2.2 (pluggable metric, incl. `ColourMetric`) — **done**, though 2.1 landed
+    first in the end
 13. 2.1 (VideoGallery + non-square fit + held-cel dedupe)
 14. 2.5 (decouple output resolution)
 15. 2.6 (segmented encode & resume)
