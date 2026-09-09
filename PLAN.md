@@ -498,14 +498,52 @@ Bad Apple is ~95% temporally static — consecutive frames are mostly identical
 black/white regions. Cache the previous frame's index grid and re-tile only the
 cells whose index changed.
 
-Roughly five lines on top of 0.1. Likely a large further win on this specific
-source, much less useful on general video — gate it behind a flag, or measure
-before committing. Note it interacts with 0.4: stochastic selection would make
-every cell "change" unless the cache compares indices *before* sampling.
+**The frame cache is dead. Measured, the win isn't there.** 600 frames of Bad
+Apple against CIFAR at `grid_size=8` (32x24 grid, 16x16 cells, colour):
+
+| stage | ms/frame |
+|---|---|
+| decode | 0.31 |
+| match | 0.30 |
+| assemble | 0.08 |
+| ffmpeg encode | 1.11 |
+
+Only assembly is skippable — you have to compute cell means to know what
+changed, so `match()` runs whatever happens. At 10.2% of cells changing key
+that's 90% of 0.08 ms out of ~1.8, a **4% ceiling**, and a masked scatter into
+a persisted buffer gives some of that back against the current one-shot fancy
+index. The pipeline is encode-bound. Not worth the code.
+
+**What landed instead: `hold_tiles`.** The same measurement turned up 11.4% of
+tile *indices* changing per frame against 10.2% of cells changing colour. The
+gap is cells re-rolling their bucket for no reason, which is a shimmer on
+static regions, and it's the interaction with 0.4 this item predicted — just
+as a quality bug rather than a cache-invalidation one.
+
+So the fix is the one the note above describes: compare keys *before* sampling.
+`Metric` gained `keys(frame)` and `sample(keys)` (both metrics already split
+that way inside `match()`, so the shared half became `draw_from_buckets()`),
+and `SteadyMetric` wraps a metric to hold last frame's tile wherever the key is
+unchanged. `hold_tiles` on `UserConfig`, default on, no-op at `candidates=1`.
+Notes in `docs/colour-matching.md`, tests in `tests/test_temporal.py`.
+
+**Measured.** Tile churn, same 600 frames:
+
+| | churn |
+|---|---|
+| `colour_bins=32`, median 2 candidates a bucket | 11.4% → 10.2% |
+| `colour_bins=8`, 256 candidates a bucket | 99.4% → 6.9% |
+
+10.2% is the floor — that's the picture changing. The first row barely moves
+because CIFAR over a 32-bin lattice leaves buckets two deep. The second row is
+the video-gallery shape (clustered tiles, deep buckets) and it says every
+single cell was redrawing every frame. Match cost is 0.31 ms/frame either way.
 
 **Testable when:** output is identical to the uncached path (with stochastic
 selection seeded or disabled), and measured frame time drops on a
-low-motion source.
+low-motion source. ✅ superseded — `tests/test_temporal.py` asserts a repeated
+frame returns identical indices, that only the cells whose key moved resample,
+and that `candidates=1` is unchanged.
 
 ---
 
@@ -615,6 +653,7 @@ Exposed flags (all optional if in config):
 --metric               brightness | colour  (default: colour)
 --stochastic / --no-stochastic   vary tile choice among equal matches (default: on)
 --seed INT             RNG seed for stochastic selection
+--hold-tiles / --no-hold-tiles   keep a cell's tile while its bucket is unchanged (default: on)
 --start FLOAT          source start time in seconds
 --duration FLOAT       seconds of source to process
 --segment INT          frames per encode segment (default: 5000)
@@ -659,7 +698,8 @@ nothing has to be unpicked once the target-scale constraints bite.
 13. 2.1 (VideoGallery + non-square fit + held-cel dedupe)
 14. 2.5 (decouple output resolution)
 15. 2.6 (segmented encode & resume)
-16. 2.3 (temporal caching, measure first)
+16. 2.3 (temporal caching) — **done, out of order**; measured first, and the
+    cache half didn't survive the measurement
 17. 2.4 (grid-size-1) — **done, out of order**; it needed a real change, and it
     is what motivated 1.2c
 18. 2.8 (CLI + config file)

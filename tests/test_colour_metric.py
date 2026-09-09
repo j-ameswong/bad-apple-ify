@@ -188,8 +188,10 @@ def test_build_metric_picks_the_metric_the_config_names(cell_gallery):
                             aspect_ratio=(4, 4), grid=(4, 4), cell_size=CELL)
 
     def built(name):
+        # hold_tiles off so this sees the metric itself, not a SteadyMetric
+        # wrapper around it — that choice has its own test in test_temporal.
         config = UserConfig(input_dir="", output_dir="", metric=name,
-                            contrast=1.0, candidates=4)
+                            contrast=1.0, candidates=4, hold_tiles=False)
         return build_metric(cell_gallery, config, derived)
 
     assert isinstance(built("colour"), ColourMetric)

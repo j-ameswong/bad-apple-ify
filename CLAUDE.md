@@ -70,6 +70,10 @@ User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
 - `colour_bins` — colour only. Lattice edge, so `bins³` buckets; 2–64, default 32.
   The accuracy knob, and it bites: at 8 a bucket spans 32 levels a channel and
   Bad Apple's black background fills with grey tiles
+- `hold_tiles` — keep a cell's tile while its bucket key is unchanged (default
+  on). Without it every cell re-draws from its bucket every frame and static
+  regions boil: at `colour_bins=8` on Bad Apple, 99.4% of tiles changed per
+  frame against 6.9% with it on. Free, and a no-op at `candidates=1`
 - `seed` — RNG seed for the sampling; fixed seed = reproducible output
 - `gallery_budget` — bytes of tiles to refuse past (default 8 GB). `load_gallery()`
   estimates `N × cell_h × cell_w × 3` before decoding anything and raises
@@ -93,9 +97,9 @@ The entire pipeline is single-file (`main.py`):
 3. **`load_gallery()`** — calls `source.load()` through an on-disk cache of `.npy` tile arrays under `.cache/gallery/`, keyed by `cache_key()` = sha256 of `(fingerprint, cell size)`. A hit skips the decode entirely (and the size estimate — it knows the real answer); writes go via a temp file and rename. `use_cache=False` bypasses the cache but not `check_gallery_budget()`. Metric precompute is *not* cached — it is ~10 ms against a 38 MB read
 4. **`gallery_brightness()`** — precomputes per-tile brightness scalars (0–1)
 5. **`shrink_gallery()`** — filters gallery to a percentile band around 50% brightness, controlled by `config.contrast`
-6. **`Metric`** — protocol for matchers: `precompute(gallery, cell_size, brightness=None)` builds the lookup and keeps only the tiles it can reach, `match(frame)` turns a whole frame into a `(grid_y, grid_x)` array of tile indices, `tiles` is what those index. Grid-wise, never cell-wise — a per-cell `score()` puts back the Python loop 0.1 removed. `BrightnessMetric` buckets the gallery into a 256-level table (one bucket per possible cell level, holding the `candidates` nearest images, none further than `epsilon`); `ColourMetric` buckets it onto a `colour_bins`³ BGR lattice, with a BFS fill so an empty lattice cell borrows the nearest occupied one. Both sample uniformly from the cell's bucket, resize nothing, and reject a gallery that is not already at cell size. See `docs/colour-matching.md`
+6. **`Metric`** — protocol for matchers: `precompute(gallery, cell_size, brightness=None)` builds the lookup and keeps only the tiles it can reach, `match(frame)` turns a whole frame into a `(grid_y, grid_x)` array of tile indices, `tiles` is what those index. Grid-wise, never cell-wise — a per-cell `score()` puts back the Python loop 0.1 removed. `BrightnessMetric` buckets the gallery into a 256-level table (one bucket per possible cell level, holding the `candidates` nearest images, none further than `epsilon`); `ColourMetric` buckets it onto a `colour_bins`³ BGR lattice, with a BFS fill so an empty lattice cell borrows the nearest occupied one. Both sample uniformly from the cell's bucket, resize nothing, and reject a gallery that is not already at cell size. `match()` splits into `keys(frame)` (which bucket a cell lands in) and `sample(keys)` (which tile it draws from that bucket), so `SteadyMetric` can wrap either metric and hold a cell's tile while its key is unchanged. See `docs/colour-matching.md`
 7. **`mosaic_frame()`** — assembles the matched tiles into a single mosaic frame; **`build_mosaics()`** maps it lazily over the frame stream (one frame in, one mosaic out, so peak memory never scales with video length)
-8. **`build_metric()`** — steps 4–6 as one stage: brightness, shrink, then `precompute()` on whichever `Metric` `config.metric` names
+8. **`build_metric()`** — steps 4–6 as one stage: brightness, shrink, then `precompute()` on whichever `Metric` `config.metric` names, wrapped in `SteadyMetric` unless `hold_tiles` is off
 9. **`encode_video()`** — owns the ffmpeg pipe, writing raw mosaic frames to its stdin; **`combine_videos()`** runs ffmpeg again for the side-by-side output, scaling the source to the mosaic's size (`hstack` demands equal heights and the two only match by coincidence)
 10. **`main(gallery_source, config)`** — pure orchestration, no logic of its own: probe → load → build metric → stream → mosaic → encode → combine. It takes a `GallerySource` and never touches CIFAR-specific code; the `UserConfig` is built at the call site in `__main__`
 

@@ -20,6 +20,55 @@ takes the whole frame and answers for every cell at once.
 `shrink_gallery()` already computed. It's an offer, not a requirement:
 `ColourMetric` ignores it.
 
+`match()` is really two steps, and the protocol exposes both:
+
+```python
+def keys(self, frame: Image) -> Indices:   # (H, W, 3) -> bucket per cell
+def sample(self, keys: Indices) -> Indices # bucket per cell -> tile per cell
+```
+
+`keys()` is where the metrics differ — a brightness level for one, a lattice
+index for the other. `sample()` is the same three lines either way, so it lives
+in `draw_from_buckets()` and both call it. Splitting them is what lets
+`hold_tiles` compare frames by what they *look* like rather than by which tile
+the RNG happened to hand out.
+
+## Holding a tile still
+
+A cell picks uniformly from its bucket, so with `candidates` above 1 it draws
+again every frame even when nothing in front of it has moved. Static regions
+boil. `hold_tiles` (default on) wraps the metric in `SteadyMetric`, which keeps
+last frame's tile wherever the key is unchanged and only lets the RNG near the
+cells that actually moved.
+
+Measured over 600 frames of Bad Apple against CIFAR at `grid_size=8`, where
+10.2% of cells change key frame to frame:
+
+| | tile churn |
+|---|---|
+| `colour_bins=32` (median 2 candidates a bucket) | 11.4% → 10.2% |
+| `colour_bins=8` (256 candidates a bucket) | 99.4% → 6.9% |
+
+10.2% is the floor: it's the picture changing. The first row barely moves
+because CIFAR spread over a 32-bin lattice leaves two tiles in a bucket, so
+there's little to re-roll between. The second row is the one to look at, and
+it's the shape a video gallery has — 41k anime frames cluster hard, buckets get
+deep, and *every* cell was redrawing every frame.
+
+It costs nothing. `SteadyMetric.sample()` draws for the whole grid and then
+masks, because an RNG call over 768 cells is beneath measurement and a partial
+draw needs bookkeeping that isn't. Match time is 0.31 ms/frame either way.
+
+Turn it off with `hold_tiles=False` if you want the old behaviour; at
+`candidates=1` it's a no-op, since a bucket of one has nothing to re-roll.
+
+Note what this is *not*. PLAN.md's 2.3 asked for a frame cache — re-tile only
+the cells whose index changed — and that's dead. You have to compute cell means
+to know what changed, so `match()` runs regardless, and the only skippable work
+is assembly at 0.08 ms of a ~1.8 ms frame. At 90% of cells held that's a 4%
+ceiling, against a pipeline whose real cost is ffmpeg at 1.11 ms/frame. The
+stability was the part worth having.
+
 ## Why colour at all
 
 Brightness throws away two thirds of the signal, and it shows most on exactly

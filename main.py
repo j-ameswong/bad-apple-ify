@@ -45,6 +45,7 @@ class UserConfig:
     epsilon: float = 0.005  # brightness only: max error (0-1) a candidate may have
     colour_bins: int = 32  # colour only: lattice edge, so bins^3 buckets
     seed: int = 0
+    hold_tiles: bool = True  # keep a cell's tile while its bucket is unchanged
     gallery_budget: int = HARD_BUDGET  # bytes of tiles to refuse past
 
 
@@ -567,6 +568,18 @@ class Metric(Protocol):
         """
         ...
 
+    def keys(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of bucket keys.
+
+        A key says which bucket a cell landed in, not which tile it got. Two
+        frames agreeing here agree about the picture; see docs/colour-matching.md.
+        """
+        ...
+
+    def sample(self, keys: Indices) -> Indices:
+        """Bucket keys -> one tile index each, drawn from the bucket."""
+        ...
+
     def match(self, frame: Image) -> Indices:
         """(H, W, 3) frame -> (grid_y, grid_x) array of indices into `tiles`."""
         ...
@@ -628,6 +641,18 @@ def compact_buckets(lo: Indices, count: Indices, n: int) -> tuple[Indices, Indic
     return reachable, remap
 
 
+def draw_from_buckets(lo: Indices, count: Indices, remap: Indices,
+                      keys: Indices, rng: np.random.Generator) -> Indices:
+    """Pick one tile per key, uniformly among its bucket's candidates.
+
+    Both metrics reduce to this once they've turned a frame into keys — a
+    brightness level and a lattice index index the same three arrays.
+    """
+    picks = lo[keys] + rng.integers(count[keys])
+    indices: Indices = remap[picks]
+    return indices
+
+
 class BrightnessMetric:
     """Match each cell to a gallery image of near-identical average brightness.
 
@@ -683,16 +708,19 @@ class BrightnessMetric:
         self._tiles = gallery[order[reachable]]
         self._cell_w, self._cell_h = cell_size
 
-    def match(self, frame: Image) -> Indices:
-        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
+    def keys(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of brightness levels."""
         grey = cast(Image, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         means = cell_means(grey, (self._cell_w, self._cell_h))
-        levels = np.rint(means).astype(np.uint8)
+        return np.rint(means).astype(np.int64)
 
-        lo = self._lo[levels]
-        picks = lo + self._rng.integers(self._count[levels])
-        indices: Indices = self._remap[picks]
-        return indices
+    def sample(self, keys: Indices) -> Indices:
+        return draw_from_buckets(self._lo, self._count, self._remap,
+                                 keys, self._rng)
+
+    def match(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
+        return self.sample(self.keys(frame))
 
     @property
     def bucket_size(self) -> float:
@@ -782,12 +810,17 @@ class ColourMetric:
         flat: Indices = (q[..., 0] * self._bins + q[..., 1]) * self._bins + q[..., 2]
         return flat
 
+    def keys(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of lattice indices."""
+        return self._quantise(cell_means(frame, (self._cell_w, self._cell_h)))
+
+    def sample(self, keys: Indices) -> Indices:
+        return draw_from_buckets(self._lo, self._count, self._remap,
+                                 keys, self._rng)
+
     def match(self, frame: Image) -> Indices:
         """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
-        keys = self._quantise(cell_means(frame, (self._cell_w, self._cell_h)))
-        picks = self._lo[keys] + self._rng.integers(self._count[keys])
-        indices: Indices = self._remap[picks]
-        return indices
+        return self.sample(self.keys(frame))
 
     @property
     def bucket_size(self) -> float:
@@ -803,6 +836,51 @@ class ColourMetric:
     def tiles(self) -> Image:
         """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
         return self._tiles
+
+
+class SteadyMetric:
+    """Hold a cell's tile for as long as its bucket key doesn't change.
+
+    Without this every cell re-rolls its bucket every frame, so a region that
+    isn't moving still shimmers — 11.4% of tile indices change per frame on Bad
+    Apple where only 10.2% of cells change colour, and the gap widens with
+    `candidates`. See docs/colour-matching.md.
+    """
+
+    def __init__(self, inner: Metric):
+        self._inner = inner
+        # Last frame's keys beside what they drew, or None on the first frame.
+        self._previous: tuple[Indices, Indices] | None = None
+
+    def precompute(self, gallery: Image, cell_size: tuple[int, int],
+                   brightness: Brightness | None = None) -> None:
+        self._inner.precompute(gallery, cell_size, brightness)
+
+    def keys(self, frame: Image) -> Indices:
+        return self._inner.keys(frame)
+
+    def sample(self, keys: Indices) -> Indices:
+        # Draws for every cell and throws most of it away — cheaper than the
+        # bookkeeping a partial draw needs.
+        picks = self._inner.sample(keys)
+        if self._previous is not None:
+            last_keys, last_picks = self._previous
+            picks = np.where(keys == last_keys, last_picks, picks)
+        self._previous = (keys, picks)
+        return picks
+
+    def match(self, frame: Image) -> Indices:
+        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
+        return self.sample(self.keys(frame))
+
+    @property
+    def bucket_size(self) -> float:
+        return self._inner.bucket_size
+
+    @property
+    def tiles(self) -> Image:
+        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
+        return self._inner.tiles
 
 
 def mosaic_frame(frame: Image, metric: Metric) -> Image:
@@ -846,6 +924,8 @@ def build_metric(gallery: Image, config: UserConfig,
     else:
         metric = BrightnessMetric(candidates=config.candidates,
                                   epsilon=config.epsilon, seed=config.seed)
+    if config.hold_tiles:
+        metric = SteadyMetric(metric)
     metric.precompute(gallery, derived.cell_size, brightness)
     print(f"Gallery: {len(gallery)} images -> {len(metric.tiles)} usable tiles, "
           f"{metric.bucket_size:.0f} candidates per cell (median)")
