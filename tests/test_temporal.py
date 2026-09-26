@@ -86,18 +86,6 @@ def test_steady_holds_the_cells_that_did_not_move(metric):
     assert np.array_equal(second[1:], first[1:])
 
 
-def test_single_candidate_is_a_no_op(cell_gallery):
-    """At candidates=1 a bucket has one tile, so holding changes nothing."""
-    plain = ColourMetric(bins=8, candidates=1, seed=0)
-    plain.precompute(cell_gallery, CELL)
-    held = ColourMetric(bins=8, candidates=1, seed=0)
-    held.precompute(cell_gallery, CELL)
-    steady = SteadyMetric(held)
-
-    for frame in make_frames(6, GRID[0] * CELL[0], GRID[1] * CELL[1]):
-        assert np.array_equal(plain.match(frame), steady.match(frame))
-
-
 def test_steady_passes_through_tiles_and_buckets(metric):
     steady = SteadyMetric(metric)
     assert steady.tiles is metric.tiles

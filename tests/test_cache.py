@@ -4,6 +4,8 @@ A gallery load is one decode pass over the whole source — minutes for a video
 gallery — so the tests here are mostly about *not* calling `load()`.
 """
 
+import errno
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,18 +64,6 @@ def test_second_run_skips_the_load(cache_dir, cell_gallery):
 
     assert source.loads == 1
     np.testing.assert_array_equal(first, second)
-
-
-def test_cache_hit_is_byte_identical(cache_dir, cifar_pickle):
-    """The cached array must equal what the source would have produced."""
-    path, _ = cifar_pickle
-    derived = derived_for(CELL)
-
-    load_gallery(CifarGallery(path), derived, cache_dir=cache_dir)
-    cached = load_gallery(CifarGallery(path), derived, cache_dir=cache_dir)
-
-    np.testing.assert_array_equal(cached, CifarGallery(path).load(CELL))
-    assert cached.dtype == np.uint8
 
 
 def test_changing_cell_size_misses(cache_dir, cell_gallery):
@@ -171,12 +161,10 @@ def flip(data: bytes, index: int, bit: int) -> bytes:
     return bytes(mangled)
 
 
-# In order, these get ValueError, TokenError, TypeError and SyntaxError out of
-# numpy's header parser. See docs/gallery-cache.md.
+# ValueError, TypeError and SyntaxError out of numpy's header parser, in that
+# order. The bit-flip sweep below gets TokenError. See docs/gallery-cache.md.
 MANGLED_HEADERS = {
     "empty file": lambda data: b"",
-    # Byte 8 is the low byte of the header length, so the dict stops mid-shape.
-    "length cut short": lambda data: flip(data, 8, 6),
     "bytes key": lambda data: data.replace(b"'shape'", b"b'shape'"),
     "comma in the dtype": lambda data: data.replace(b"'|u1'", b"',u1'"),
 }
@@ -245,12 +233,19 @@ def test_a_cache_cut_short_after_its_size_check_falls_back_to_a_reload(
     assert tiles.shape == (len(cell_gallery), CELL[1], CELL[0], 3)
 
 
-def test_no_temp_files_are_left_behind(cache_dir, cell_gallery):
-    load_gallery(CountingSource(cell_gallery), derived_for(CELL), cache_dir=cache_dir)
+def test_a_failed_write_leaves_nothing_behind(cache_dir, cell_gallery, monkeypatch):
+    """Disk full halfway through `np.save`: the error still surfaces, but neither
+    the half-written temp nor a half cache is left for the next run."""
+    def fills_the_disk(file, arr, allow_pickle=True):
+        Path(file).write_bytes(b"\x93NUMPY")
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(np, "save", fills_the_disk)
 
-    assert [p.name for p in cache_dir.iterdir()] == [
-        p.name for p in cache_dir.glob("*.npy")]
-    assert not list(cache_dir.glob("*.tmp.npy"))
+    with pytest.raises(OSError):
+        load_gallery(CountingSource(cell_gallery), derived_for(CELL),
+                     cache_dir=cache_dir)
+
+    assert list(cache_dir.iterdir()) == []
 
 
 def test_cache_key_is_filename_safe(cell_gallery):

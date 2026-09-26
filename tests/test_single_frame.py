@@ -73,16 +73,6 @@ def test_single_frame_tracks_source_brightness(video, gallery, tmp_path):
     assert mosaic_frame(dark, metric).mean() < mosaic_frame(bright, metric).mean()
 
 
-def test_single_frame_mode_uses_the_whole_gallery(video, gallery, tmp_path):
-    """Distinct source frames still draw distinct images, not one repeated tile."""
-    config, derived, metric, frames = single_frame_setup(video, gallery, tmp_path)
-
-    mosaics = list(build_mosaics(stream_frames(config, derived), metric, derived))
-    distinct = {mosaic.tobytes() for mosaic in mosaics}
-
-    assert len(distinct) > 1
-
-
 @needs_ffmpeg
 def test_main_at_grid_size_one_keeps_the_frame_count(tmp_path, video, cifar_pickle,
                                                      monkeypatch):

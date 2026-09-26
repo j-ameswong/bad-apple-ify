@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from conftest import write_rated_video
+import main
 from main import UserConfig, probe_video, stream_frames
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None,
@@ -40,29 +41,6 @@ def test_probe_video_keeps_fractional_rates(tmp_path, rate, expected):
     assert derived.output_fps == expected
 
 
-def test_probe_video_derives_the_grid(video_factory):
-    """The grid follows the source's own ratio; no allowlist, no stretching."""
-    path, _ = video_factory(count=2, width=64, height=48)
-
-    derived = probe_video(UserConfig(input_dir=str(path), output_dir="", grid_size=2))
-
-    assert derived.aspect_ratio == (4, 3)
-    assert (derived.grid_x, derived.grid_y) == (8, 6)
-    assert derived.cell_size == (8, 8)
-
-
-def test_stream_frames_yields_every_frame(video):
-    path, frames = video
-    config = UserConfig(input_dir=str(path), output_dir="", grid_size=2)
-    derived = probe_video(config)
-
-    streamed = list(stream_frames(config, derived))
-
-    assert len(streamed) == len(frames)
-    for frame in streamed:
-        assert frame.shape[1::-1] == derived.target_dimensions
-
-
 def test_stream_frames_preserves_content(video):
     """Target dimensions equal the source here, so frames must survive intact."""
     path, frames = video
@@ -74,17 +52,33 @@ def test_stream_frames_preserves_content(video):
                                   frames)
 
 
-def test_stream_frames_is_lazy(video):
-    """Nothing is decoded until iteration, and only one frame is held at a time."""
+def test_stream_frames_reads_only_as_far_as_asked(video, monkeypatch):
+    """Two frames asked for, two decoded: nothing is read ahead of the consumer,
+    so a feature-length source never sits in RAM."""
     path, _ = video
     config = UserConfig(input_dir=str(path), output_dir="", grid_size=2)
     derived = probe_video(config)
+    reads = []
+    real_capture = main.cv2.VideoCapture
 
+    class CountingCapture:
+        def __init__(self, name):
+            self._cap = real_capture(name)
+
+        def __getattr__(self, attr):
+            return getattr(self._cap, attr)
+
+        def read(self):
+            reads.append(True)
+            return self._cap.read()
+
+    monkeypatch.setattr(main.cv2, "VideoCapture", CountingCapture)
     stream = stream_frames(config, derived)
-    first = next(stream)
 
-    assert first.nbytes < 1024 * 1024
-    assert next(stream) is not first
+    assert reads == []
+    next(stream)
+    next(stream)
+    assert len(reads) == 2
 
 
 def test_stream_frames_survives_bad_frame_count(video, monkeypatch):

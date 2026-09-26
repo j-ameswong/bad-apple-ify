@@ -1,8 +1,6 @@
 import numpy as np
 
-from conftest import CELL
-from main import (BrightnessMetric, CifarGallery, UserConfig, gallery_brightness,
-                  mosaic_frame, probe_video, stream_frames)
+from main import mosaic_frame, resize_gallery_to_cells
 
 
 def assemble_by_loop(tiles: np.ndarray, indices: np.ndarray) -> np.ndarray:
@@ -17,78 +15,31 @@ def assemble_by_loop(tiles: np.ndarray, indices: np.ndarray) -> np.ndarray:
     return out
 
 
-def test_vectorised_assembly_is_byte_identical(cell_gallery):
-    """0.1: fancy indexing + transpose must equal the nested-loop placement."""
-    metric = BrightnessMetric(candidates=8, epsilon=0.1, seed=0)
-    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
+class FixedMatch:
+    """A metric that's already made up its mind, so the test knows exactly
+    which tile `mosaic_frame()` was told to put in which cell."""
 
-    rng = np.random.default_rng(2)
-    frame = rng.integers(0, 256, (CELL[1] * 6, CELL[0] * 9, 3), dtype=np.uint8)
+    def __init__(self, tiles: np.ndarray, indices: np.ndarray):
+        self.tiles = tiles
+        self._indices = indices
 
-    indices = metric.match(frame)
-    fast = metric.tiles[indices]
-    grid_y, grid_x, cell_h, cell_w, _ = fast.shape
-    fast = fast.transpose(0, 2, 1, 3, 4).reshape(grid_y * cell_h, grid_x * cell_w, 3)
-
-    np.testing.assert_array_equal(fast, assemble_by_loop(metric.tiles, indices))
+    def match(self, frame: np.ndarray) -> np.ndarray:
+        return self._indices
 
 
-def test_mosaic_frame_preserves_frame_size(cell_gallery):
-    metric = BrightnessMetric(candidates=4, epsilon=0.1, seed=0)
-    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
-    frame = np.full((CELL[1] * 5, CELL[0] * 7, 3), 90, dtype=np.uint8)
+def test_vectorised_assembly_is_byte_identical(gallery):
+    """0.1: `mosaic_frame()` must place tiles exactly where the nested loop did.
 
-    mosaic = mosaic_frame(frame, metric)
-
-    assert mosaic.shape == frame.shape
-    assert mosaic.dtype == np.uint8
-
-
-def test_every_block_of_the_mosaic_is_a_gallery_tile(cell_gallery):
-    """No blending or interpolation: each cell is one image, placed whole."""
-    metric = BrightnessMetric(candidates=4, epsilon=0.1, seed=0)
-    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
-    rng = np.random.default_rng(3)
-    frame = rng.integers(0, 256, (CELL[1] * 4, CELL[0] * 4, 3), dtype=np.uint8)
-
-    mosaic = mosaic_frame(frame, metric)
-
-    blocks = mosaic.reshape(4, CELL[1], 4, CELL[0], 3).transpose(0, 2, 1, 3, 4)
-    for block in blocks.reshape(-1, CELL[1], CELL[0], 3):
-        assert any(np.array_equal(block, tile) for tile in metric.tiles)
-
-
-def test_mosaic_tracks_frame_brightness(cell_gallery):
-    """A brighter frame must produce a brighter mosaic."""
-    metric = BrightnessMetric(candidates=4, epsilon=0.05, seed=0)
-    metric.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
-    shape = (CELL[1] * 4, CELL[0] * 4, 3)
-
-    dark = mosaic_frame(np.full(shape, 40, dtype=np.uint8), metric)
-    light = mosaic_frame(np.full(shape, 210, dtype=np.uint8), metric)
-
-    assert dark.mean() < light.mean()
-
-
-def test_pipeline_over_a_video(video, cifar_pickle):
-    """Every source frame yields one mosaic at the configured target size.
-
-    Runs in the 1.2 order: probe the source, then load the gallery at the cell
-    size that probe derived.
+    Cells and grid are both non-square and every cell gets a different tile, so
+    no mix-up of axes can cancel out. At 4x4, swapping cell_h for cell_w would.
     """
-    path, frames = video
-    config = UserConfig(input_dir=str(path), output_dir="", grid_size=2,
-                        candidates=8, epsilon=0.1)
-    derived = probe_video(config)
+    cell_w, cell_h = 5, 3
+    tiles = resize_gallery_to_cells(gallery, (cell_w, cell_h))
+    grid_y, grid_x = 6, 9
+    rng = np.random.default_rng(2)
+    indices = rng.permutation(len(tiles))[:grid_y * grid_x].reshape(grid_y, grid_x)
+    frame = np.zeros((grid_y * cell_h, grid_x * cell_w, 3), dtype=np.uint8)
 
-    tiles = CifarGallery(cifar_pickle[0]).load(derived.cell_size)
-    metric = BrightnessMetric(candidates=config.candidates,
-                              epsilon=config.epsilon, seed=config.seed)
-    metric.precompute(tiles, derived.cell_size, gallery_brightness(tiles))
+    mosaic = mosaic_frame(frame, FixedMatch(tiles, indices))
 
-    mosaics = [mosaic_frame(frame, metric)
-               for frame in stream_frames(config, derived)]
-
-    assert len(mosaics) == len(frames)
-    for mosaic in mosaics:
-        assert mosaic.shape[1::-1] == derived.target_dimensions
+    np.testing.assert_array_equal(mosaic, assemble_by_loop(tiles, indices))

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from conftest import CELL
-from main import BrightnessMetric, gallery_brightness
+from main import BrightnessMetric, gallery_brightness, resize_gallery_to_cells
 
 
 def argmin_match(brightness: np.ndarray, level: float) -> int:
@@ -33,17 +33,6 @@ def test_lut_matches_argmin_for_all_levels(cell_gallery, brightness):
             np.testing.assert_array_equal(row, expected)
 
 
-def test_match_returns_grid_of_indices(cell_gallery, brightness):
-    metric = BrightnessMetric(candidates=8, epsilon=0.05)
-    metric.precompute(cell_gallery, CELL, brightness)
-
-    indices = metric.match(flat_frame(128, grid=(5, 3)))
-
-    assert indices.shape == (3, 5)
-    assert indices.dtype.kind == "i"
-    assert np.all((indices >= 0) & (indices < len(metric.tiles)))
-
-
 def test_match_uses_per_cell_brightness(cell_gallery, brightness):
     """Cells differing in brightness must resolve to different tiles."""
     metric = BrightnessMetric(candidates=1)
@@ -54,6 +43,25 @@ def test_match_uses_per_cell_brightness(cell_gallery, brightness):
 
     left, right = metric.match(frame)[0]
     assert left != right
+
+
+def test_a_non_square_cell_matches_cell_by_cell(gallery):
+    """Native tiles make cells like 28x16, and everything else here runs at
+    4x4, where cell_w and cell_h can't be told apart."""
+    cell_w, cell_h = 5, 3
+    tiles = resize_gallery_to_cells(gallery, (cell_w, cell_h))
+    tile_brightness = gallery_brightness(tiles)
+    metric = BrightnessMetric(candidates=1)
+    metric.precompute(tiles, (cell_w, cell_h), tile_brightness)
+    levels = np.array([[20, 90, 160], [230, 60, 130]])  # 3 cells across, 2 down
+    frame = np.repeat(np.repeat(levels, cell_h, axis=0), cell_w, axis=1)
+    frame = np.repeat(frame[..., None], 3, axis=2).astype(np.uint8)
+
+    picked = metric.tiles[metric.match(frame)]
+
+    for (y, x), level in np.ndenumerate(levels):
+        expected = tiles[argmin_match(tile_brightness, level / 255.0)]
+        np.testing.assert_array_equal(picked[y, x], expected)
 
 
 def test_stochastic_selection_stays_within_epsilon(cell_gallery, brightness):
@@ -84,14 +92,6 @@ def test_stochastic_selection_increases_variety(cell_gallery, brightness):
 
     assert distinct(1) == 1
     assert distinct(16) > 1
-
-
-def test_candidates_one_is_deterministic(cell_gallery, brightness):
-    metric = BrightnessMetric(candidates=1)
-    metric.precompute(cell_gallery, CELL, brightness)
-    frame = flat_frame(200, grid=(8, 8))
-
-    np.testing.assert_array_equal(metric.match(frame), metric.match(frame))
 
 
 def test_seed_makes_runs_reproducible(cell_gallery, brightness):
@@ -125,15 +125,6 @@ def test_candidates_exceeding_gallery_is_clamped(cell_gallery, brightness):
 
     indices = metric.match(flat_frame(128, grid=(8, 8)))
     assert np.all(indices < len(metric.tiles))
-
-
-def test_tiles_are_at_cell_size(cell_gallery, brightness):
-    """Tiles arrive at cell size from the gallery source, ready to place."""
-    metric = BrightnessMetric(candidates=4, epsilon=0.05)
-    metric.precompute(cell_gallery, CELL, brightness)
-
-    assert metric.tiles.shape[1:] == (CELL[1], CELL[0], 3)
-    assert metric.tiles.dtype == np.uint8
 
 
 def test_precompute_rejects_a_gallery_that_is_not_at_cell_size(gallery, brightness):

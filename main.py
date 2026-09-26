@@ -243,7 +243,7 @@ def read_cifar_batch(path: Path) -> Image:
 
         # reminder to self, transpose works by putting in the old positions
         temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
-        # Contiguous because cv2 will not take a reverse-strided view later.
+        # Faster to resize from, not required by cv2. See docs/gallery-sources.md.
         return np.ascontiguousarray(temp[..., ::-1])  # RGB -> BGR
 
 

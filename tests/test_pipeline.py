@@ -40,6 +40,17 @@ def test_build_metric_trims_the_gallery(cell_gallery):
     assert narrow.tiles.mean() == pytest.approx(cell_gallery.mean(), abs=8)
 
 
+@pytest.mark.parametrize("metric", ["brightness", "colour"])
+def test_a_gallery_trimmed_to_nothing_says_so(metric):
+    """Four tiles at the default contrast=0.1 leave none in the band. That has
+    to be a plain error, not an IndexError from deep in the brightness lookup."""
+    tiles = np.stack([np.full((CELL[1], CELL[0], 3), v, dtype=np.uint8)
+                      for v in (10, 80, 160, 240)])
+
+    with pytest.raises(ValueError, match="empty"):
+        build_metric(tiles, _config(metric=metric), _derived_for(CELL))
+
+
 def test_build_mosaics_matches_frame_by_frame(cell_gallery):
     """The stream is exactly `mosaic_frame` applied in order, nothing more."""
     frames = list(make_frames(5, CELL[0] * 4, CELL[1] * 3, seed=7))
@@ -118,6 +129,18 @@ def test_combine_videos_stacks_side_by_side(tmp_path, video_factory):
 
 
 @needs_ffmpeg
+def test_combine_videos_raises_when_ffmpeg_fails(tmp_path, video_factory):
+    source, _ = video_factory(count=2, width=64, height=48)
+    mosaic_path = tmp_path / "mosaic.mkv"
+    write_video(mosaic_path, make_frames(2, 32, 24, seed=5))
+
+    # A directory that does not exist: ffmpeg cannot open the output.
+    with pytest.raises(RuntimeError, match="ffmpeg combine failed"):
+        combine_videos(source, mosaic_path, tmp_path / "nope" / "combined.mkv",
+                       (32, 24))
+
+
+@needs_ffmpeg
 def test_main_orchestrates_end_to_end(tmp_path, video, cifar_pickle, monkeypatch):
     """main() produces both videos from a source and a GallerySource alone."""
     monkeypatch.chdir(tmp_path)  # keep the gallery cache out of the repo
@@ -157,6 +180,28 @@ def test_main_encodes_1080p_against_widescreen_tiles(tmp_path, video_factory,
 
     assert read_video(tmp_path / "out" / "output.mp4").shape == (3, 1080, 1944, 3)
     assert read_video(combined).shape[1:3] == (1080, 1944 * 2)
+
+
+@needs_ffmpeg
+def test_main_under_stretch_keeps_the_square_grid(tmp_path, video, video_factory,
+                                                  monkeypatch):
+    """Whether the gallery's shape reaches the probe is `main()`'s call, so it
+    has to run to be tested. 16:9 tiles would widen this 4:3 grid under
+    `native`; `stretch` has to leave it exactly as it was."""
+    monkeypatch.chdir(tmp_path)  # keep the gallery cache out of the repo
+    source, _ = video
+    gallery_path, _ = video_factory(count=4, width=96, height=54, seed=3)
+    gallery = VideoGallery(gallery_path, stride=1)
+    config = UserConfig(input_dir=str(source), output_dir=str(tmp_path / "out"),
+                        grid_size=2, contrast=1.0, tile_fit="stretch")
+    square = probe_video(config).target_dimensions
+    # The control: this gallery's shape would change the grid if it got through.
+    assert probe_video(config, gallery.native_aspect).target_dimensions != square
+
+    main(gallery, config)
+
+    height, width = read_video(tmp_path / "out" / "output.mp4").shape[1:3]
+    assert (width, height) == square
 
 
 @needs_ffmpeg

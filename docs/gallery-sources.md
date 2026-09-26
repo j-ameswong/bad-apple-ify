@@ -47,8 +47,12 @@ size at load time.
 Two quirks in `read_cifar_batch()`. The pickle carries a dtype serialised by an
 ancient NumPy with `align=0`, which NumPy 2.4 deprecates in its int form;
 nothing to fix from this side short of re-serialising the file, so the warning
-is suppressed. And the RGB→BGR flip produces a reverse-strided view, which cv2
-refuses later, hence the `ascontiguousarray`.
+is suppressed. And the RGB→BGR flip produces a reverse-strided view, channels
+1024 bytes apart. OpenCV 4.13 resizes that fine, so the `ascontiguousarray` is
+for speed, not correctness, and not much of it. Over 50000 images, copying then
+resizing takes 269 ms against 321 ms straight from the view at 16x16, and 297
+against 347 at 8x8. At 5x3 the view wins, 293 against 325. The copy also means
+two 147 MB arrays at once until `read_cifar_batch()` returns.
 
 `VideoGallery` decodes a video, or a directory of them, keeping every
 `stride`-th frame and deduping what comes back. See

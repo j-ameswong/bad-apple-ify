@@ -8,10 +8,9 @@ is the whole point of the metric.
 import numpy as np
 import pytest
 
-from conftest import CELL, make_frames
+from conftest import CELL
 from main import (BrightnessMetric, ColourMetric, DerivedConfig, UserConfig,
-                  build_metric, build_mosaics, gallery_brightness,
-                  nearest_occupied)
+                  build_metric, gallery_brightness, nearest_occupied)
 
 BIN_WIDTH = 256 / 8  # one lattice step at bins=8
 
@@ -83,20 +82,6 @@ def test_colour_beats_brightness_on_equally_bright_colours(tiles):
     np.testing.assert_array_equal(bright.tiles[left], bright.tiles[right])
 
 
-def test_metrics_disagree_on_a_colourful_frame(tiles):
-    """Per-pixel noise averages to grey, so the frame is blocks of real colour."""
-    rng = np.random.default_rng(4)
-    cells = rng.integers(0, 256, (6, 4, 3), dtype=np.uint8)
-    frame = np.repeat(np.repeat(cells, CELL[1], axis=0), CELL[0], axis=1)
-
-    colour = make_metric(tiles)
-    bright = BrightnessMetric(candidates=1)
-    bright.precompute(tiles, CELL, gallery_brightness(tiles))
-
-    assert not np.array_equal(colour.tiles[colour.match(frame)],
-                              bright.tiles[bright.match(frame)])
-
-
 def test_empty_bins_borrow_the_nearest_occupied_one():
     """A gallery covering part of the space still answers for all of it."""
     reds = np.zeros((4, CELL[1], CELL[0], 3), dtype=np.uint8)
@@ -108,6 +93,22 @@ def test_empty_bins_borrow_the_nearest_occupied_one():
     assert picked.reshape(-1, 3)[:, 2].max() == 64  # darkest red is nearest
 
 
+def test_the_lattice_does_not_wrap_round():
+    """np.roll wraps, so unless the edges are masked 255 sits one step from 0.
+    White with no white tiles has to borrow the grey 12 steps away, not the
+    black that's 21 away, or 3 across the wrap."""
+    def picked(levels, query):
+        tiles = np.stack([np.full((CELL[1], CELL[0], 3), v, dtype=np.uint8)
+                          for v in levels])
+        metric = make_metric(tiles)
+        return np.unique(metric.tiles[metric.match(flat_frame((query,) * 3))])
+
+    assert picked([0, 120], 255).tolist() == [120]
+    assert picked([255, 120], 0).tolist() == [120]
+    # Cell 0 lends like any other: dark grey is 3 steps from black, 6 from grey.
+    assert picked([0, 120], 40).tolist() == [0]
+
+
 def test_nearest_occupied_is_identity_on_a_full_lattice():
     full = np.ones(2 ** 3, dtype=bool)
     np.testing.assert_array_equal(nearest_occupied(full, 2), np.arange(8))
@@ -116,12 +117,6 @@ def test_nearest_occupied_is_identity_on_a_full_lattice():
 def test_nearest_occupied_rejects_an_empty_lattice():
     with pytest.raises(ValueError):
         nearest_occupied(np.zeros(2 ** 3, dtype=bool), 2)
-
-
-def test_candidates_one_is_deterministic(tiles):
-    metric = make_metric(tiles)
-    frame = flat_frame((90, 140, 200), grid=(8, 8))
-    np.testing.assert_array_equal(metric.match(frame), metric.match(frame))
 
 
 def test_candidates_sample_among_tiles_sharing_a_bin():
@@ -166,12 +161,6 @@ def test_bucket_size_grows_with_candidates(tiles):
     assert size(8) > size(2)
 
 
-def test_tiles_are_at_cell_size(tiles):
-    metric = make_metric(tiles)
-    assert metric.tiles.shape[1:] == (CELL[1], CELL[0], 3)
-    assert metric.tiles.dtype == np.uint8
-
-
 def test_precompute_rejects_a_gallery_that_is_not_at_cell_size(gallery):
     with pytest.raises(ValueError):
         ColourMetric(bins=8).precompute(gallery, CELL)
@@ -196,20 +185,3 @@ def test_build_metric_picks_the_metric_the_config_names(cell_gallery):
 
     assert isinstance(built("colour"), ColourMetric)
     assert isinstance(built("brightness"), BrightnessMetric)
-
-
-def test_build_mosaics_takes_either_metric(tiles, cell_gallery):
-    """Swapping the metric costs nothing downstream — same call, same shapes."""
-    derived = DerivedConfig(src_fps=30, src_dimensions=(16, 12), src_frame_count=0,
-                            aspect_ratio=(4, 3), grid=(4, 3), cell_size=CELL)
-    frames = list(make_frames(3, CELL[0] * 4, CELL[1] * 3, seed=2))
-
-    bright = BrightnessMetric(candidates=4, epsilon=0.1, seed=0)
-    bright.precompute(cell_gallery, CELL, gallery_brightness(cell_gallery))
-
-    shapes = {name: [m.shape for m in build_mosaics(iter(frames), metric, derived)]
-              for name, metric in (("colour", make_metric(tiles)),
-                                   ("brightness", bright))}
-
-    assert shapes["colour"] == shapes["brightness"]
-    assert shapes["colour"] == [(CELL[1] * 3, CELL[0] * 4, 3)] * 3

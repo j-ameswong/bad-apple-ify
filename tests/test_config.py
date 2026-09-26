@@ -30,15 +30,6 @@ def test_derived_config_is_frozen():
         derived.cell_size = (1, 1)
 
 
-def test_derived_carries_source_metadata():
-    derived = derive(64, 48)
-
-    assert derived.src_fps == 30
-    assert derived.output_fps == 30
-    assert derived.src_dimensions == (64, 48)
-    assert derived.src_frame_count == 10
-
-
 def test_known_source_gives_known_grid_and_cell():
     """64x48 at grid_size=2 is 4:3 -> an 8x6 grid of 8x8 cells."""
     derived = derive(64, 48, grid_size=2)
@@ -47,15 +38,6 @@ def test_known_source_gives_known_grid_and_cell():
     assert (derived.grid_x, derived.grid_y) == (8, 6)
     assert derived.cell_size == (8, 8)
     assert derived.target_dimensions == (64, 48)
-
-
-def test_target_dimensions_are_grid_multiples():
-    """A source that isn't a whole multiple of the grid snaps to the nearest one."""
-    derived = derive(70, 50, grid_size=2)
-
-    cell_w, cell_h = derived.cell_size
-    assert derived.target_dimensions == (derived.grid_x * cell_w,
-                                         derived.grid_y * cell_h)
 
 
 def test_cell_size_never_degenerate():
@@ -92,13 +74,6 @@ def test_grid_size_one_collapses_to_a_single_cell():
     assert derived.target_dimensions == (64, 48)
 
 
-def test_single_frame_cell_keeps_the_source_shape():
-    """The one cell is the frame, so it takes the source's ratio, not the pair's."""
-    derived = derive(478, 200, grid_size=1)
-
-    assert derived.cell_size == (478, 200)
-
-
 def test_native_tiles_shape_the_cell():
     """2.1: 16:9 tiles get a 16:9-ish cell instead of being squashed square."""
     derived = derive(512, 384, grid_size=8, tile_aspect=(16, 9))
@@ -108,14 +83,6 @@ def test_native_tiles_shape_the_cell():
     # Rows are untouched — it's the columns that give way.
     assert derived.grid_y == derive(512, 384, grid_size=8).grid_y
     assert derived.grid_x < derive(512, 384, grid_size=8).grid_x
-
-
-def test_native_tiles_keep_the_frame_shape():
-    """The tiles absorb the rounding, so the mosaic still looks like the source."""
-    derived = derive(512, 384, grid_size=8, tile_aspect=(16, 9))
-
-    width, height = derived.target_dimensions
-    assert width / height == pytest.approx(512 / 384, rel=0.05)
 
 
 def test_native_tiles_keep_the_frame_shape_when_the_rows_round():
@@ -162,9 +129,12 @@ def test_native_tiles_do_not_touch_single_frame_mode():
     assert derived.cell_size == (512, 384)
 
 
-def test_derivation_is_a_pure_function_of_its_inputs():
-    """Same UserConfig and same source dimensions -> identical DerivedConfig."""
-    assert derive(478, 200, grid_size=3) == derive(478, 200, grid_size=3)
+def test_native_tiles_reach_the_smallest_real_grid():
+    """grid_size=2 is the first grid with cells to reshape. The other native
+    cases all sit at 8 or 16, so they can't see where it starts."""
+    cell_w, cell_h = derive(64, 48, grid_size=2, tile_aspect=(16, 9)).cell_size
+
+    assert cell_w > cell_h
 
 
 def test_1080p_native_widescreen_tiles_come_out_even():

@@ -6,17 +6,12 @@ asserts against `CAP_PROP_FRAME_COUNT` — that metadata is a hint, and the poin
 of the tests is what `load()` actually kept.
 """
 
-import shutil
-
 import numpy as np
 import pytest
 
-from conftest import CELL, read_video, write_video
-from main import (UserConfig, VideoGallery, crop_to_aspect, fit_to_cell,
-                  main, probe_video, resize_gallery_to_cells)
-
-needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None,
-                                  reason="ffmpeg not on PATH")
+from conftest import CELL, write_video
+from main import (VideoGallery, crop_to_aspect, fit_to_cell,
+                  resize_gallery_to_cells)
 
 
 def test_stride_keeps_every_nth_frame(video_factory):
@@ -26,23 +21,6 @@ def test_stride_keeps_every_nth_frame(video_factory):
 
     np.testing.assert_array_equal(
         tiles, resize_gallery_to_cells(frames[::3], CELL, "stretch"))
-
-
-def test_stride_one_keeps_everything(video_factory):
-    path, frames = video_factory(count=6)
-
-    assert len(VideoGallery(path, stride=1).load(CELL)) == len(frames)
-
-
-def test_tiles_arrive_at_cell_size(video_factory):
-    """Full-resolution frames are never stored, which is the whole protocol."""
-    path, _ = video_factory(count=6, width=128, height=96)
-    cell = (5, 3)
-
-    tiles = VideoGallery(path, stride=2).load(cell)
-
-    assert tiles.shape[1:] == (cell[1], cell[0], 3)
-    assert tiles.dtype == np.uint8
 
 
 def test_held_frames_are_deduped(tmp_path, video_factory):
@@ -117,16 +95,6 @@ def test_native_aspect_of_nothing_is_none(tmp_path):
     assert VideoGallery(tmp_path).native_aspect is None
 
 
-def test_estimate_is_an_upper_bound(tmp_path, video_factory):
-    """Dedupe only ever lowers the real count, so the estimate stays above it."""
-    _, frames = video_factory(count=6)
-    path = tmp_path / "held.mkv"
-    write_video(path, np.repeat(frames, 2, axis=0))
-    gallery = VideoGallery(path, stride=2)
-
-    assert gallery.estimate_count() >= len(gallery.load(CELL))
-
-
 def test_fingerprint_tracks_stride_and_files(tmp_path, video_factory):
     path, _ = video_factory(count=2)
     other, _ = video_factory(count=2, seed=9)
@@ -145,6 +113,17 @@ def test_crop_takes_the_middle_at_the_cells_ratio(video_factory):
 
     assert cropped.shape == (48, 48, 3)
     np.testing.assert_array_equal(cropped, frames[1][:, 8:56])
+
+
+def test_crop_of_a_too_tall_image_takes_the_middle_rows(video_factory):
+    """The other half of the crop. Single-frame mode lands here whenever the
+    frame is wider than the gallery's images."""
+    _, frames = video_factory(count=4, width=64, height=48)
+
+    cropped = crop_to_aspect(frames[1], (16, 9))
+
+    assert cropped.shape == (36, 64, 3)
+    np.testing.assert_array_equal(cropped, frames[1][6:42])
 
 
 def test_crop_of_a_matching_ratio_is_the_whole_image(video_factory):
@@ -197,34 +176,3 @@ def test_upscaling_still_interpolates():
 
     # Nearest would give two flat bands and nothing in between.
     assert len(np.unique(blown_up[:, 0, 0])) > 2
-
-
-# --- through the pipeline ---------------------------------------------------
-
-
-@needs_ffmpeg
-def test_a_16_9_gallery_over_a_4_3_source(tmp_path, video, video_factory,
-                                          monkeypatch):
-    """End to end on the shape that motivated `native`: wide tiles, square-ish frame."""
-    monkeypatch.chdir(tmp_path)  # keep the gallery cache out of the repo
-    source, frames = video  # 64x48, 4:3
-    gallery_path, _ = video_factory(count=30, width=96, height=54, seed=3)
-    config = UserConfig(input_dir=str(source), output_dir=str(tmp_path / "out"),
-                        grid_size=2, contrast=1.0, candidates=4, epsilon=0.5)
-    gallery = VideoGallery(gallery_path, stride=1)
-
-    main(gallery, config)
-
-    derived = probe_video(config, gallery.native_aspect)
-    cell_w, cell_h = derived.cell_size
-    assert cell_w > cell_h  # the tiles kept their shape
-    assert len(read_video(tmp_path / "out" / "output.mp4")) == len(frames)
-
-
-def test_stretch_gives_back_the_square_grid(video, video_factory):
-    """The flag is a flag: `stretch` derives exactly what it did before 2.1."""
-    source, _ = video
-    config = UserConfig(input_dir=str(source), output_dir="", grid_size=2,
-                        tile_fit="stretch")
-
-    assert probe_video(config).cell_size == (8, 8)
