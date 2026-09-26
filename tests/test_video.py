@@ -1,7 +1,14 @@
+import shutil
+from fractions import Fraction
+
 import numpy as np
 import pytest
 
+from conftest import write_rated_video
 from main import UserConfig, probe_video, stream_frames
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None,
+                                  reason="ffmpeg not on PATH")
 
 
 def test_probe_video_reads_metadata(video):
@@ -12,6 +19,25 @@ def test_probe_video_reads_metadata(video):
     assert derived.output_fps == 30
     assert derived.src_dimensions == (64, 48)
     assert derived.src_frame_count == len(frames)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("rate, expected", [
+    ("30000/1001", Fraction(30000, 1001)),
+    ("24000/1001", Fraction(24000, 1001)),
+    ("60000/1001", Fraction(60000, 1001)),
+    ("2997/100", Fraction(2997, 100)),
+    ("25", Fraction(25)),
+])
+def test_probe_video_keeps_fractional_rates(tmp_path, rate, expected):
+    """29.97 rounded to 30 runs the mosaic 0.1% fast: a frame adrift every 33s."""
+    path = tmp_path / "ntsc.mp4"
+    write_rated_video(path, rate, count=10, audio=False)
+
+    derived = probe_video(UserConfig(input_dir=str(path), output_dir=""))
+
+    assert derived.src_fps == expected
+    assert derived.output_fps == expected
 
 
 def test_probe_video_derives_the_grid(video_factory):

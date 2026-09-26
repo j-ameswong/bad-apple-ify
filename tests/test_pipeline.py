@@ -12,7 +12,8 @@ import subprocess
 import numpy as np
 import pytest
 
-from conftest import CELL, make_frames, read_video, write_video
+from conftest import (CELL, make_frames, probe_stream, read_video,
+                      write_rated_video, write_video)
 from main import (BrightnessMetric, CifarGallery, DerivedConfig, UserConfig,
                   VideoGallery,
                   build_metric, build_mosaics, combine_videos, encode_video,
@@ -156,6 +157,30 @@ def test_main_encodes_1080p_against_widescreen_tiles(tmp_path, video_factory,
 
     assert read_video(tmp_path / "out" / "output.mp4").shape == (3, 1080, 1944, 3)
     assert read_video(combined).shape[1:3] == (1080, 1944 * 2)
+
+
+@needs_ffmpeg
+def test_main_keeps_an_ntsc_rate_through_to_the_output(tmp_path, cifar_pickle,
+                                                       monkeypatch):
+    """Rounded to 30, 60 frames of 29.97 came out 2.000s against 2.002s of
+    source and audio, and the gap grows a frame every 33s from there."""
+    monkeypatch.chdir(tmp_path)  # keep the gallery cache out of the repo
+    source = tmp_path / "ntsc.mp4"
+    write_rated_video(source, "30000/1001", count=60)
+    config = UserConfig(input_dir=str(source), output_dir=str(tmp_path / "out"),
+                        grid_size=2, contrast=1.0)
+
+    combined = main(CifarGallery(cifar_pickle[0]), config)
+
+    original = probe_stream(source)
+    for encoded in (tmp_path / "out" / "output.mp4", combined):
+        video = probe_stream(encoded)
+        assert video["r_frame_rate"] == "30000/1001"
+        assert video["nb_frames"] == original["nb_frames"] == "60"
+        assert video["duration"] == original["duration"]
+    # The audio is the source's, so it has to still line up with the picture.
+    assert float(probe_stream(combined, "a:0")["duration"]) == pytest.approx(
+        float(original["duration"]), abs=0.05)
 
 
 def _config(**kwargs) -> UserConfig:

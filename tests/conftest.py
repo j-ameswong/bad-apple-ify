@@ -6,6 +6,8 @@ pickle. A clean checkout with no assets is enough to run `uv run pytest`.
 """
 
 import pickle
+import subprocess
+from fractions import Fraction
 
 import cv2
 import numpy as np
@@ -56,6 +58,35 @@ def read_video(path) -> np.ndarray:
         frames.append(frame)
     cap.release()
     return np.array(frames)
+
+
+def write_rated_video(path, rate: str, count: int, width: int = 64,
+                      height: int = 48, audio: bool = True) -> None:
+    """`count` frames at an exact rate like "30000/1001", via ffmpeg itself.
+
+    `cv2.VideoWriter` can't do this: it rounds 30000/1001 to 2997/100 on the
+    way in. mp4, because its timescale holds the rate exactly where mkv's
+    millisecond timestamps only approximate it.
+    """
+    duration = Fraction(count) / Fraction(rate)
+    command = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+               "-i", f"testsrc=size={width}x{height}:rate={rate}"]
+    if audio:
+        command += ["-f", "lavfi", "-i", "sine=frequency=440", "-c:a", "aac"]
+    command += ["-frames:v", str(count), "-t", f"{float(duration):.6f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)]
+    subprocess.run(command, check=True)
+
+
+def probe_stream(path, stream: str = "v:0") -> dict[str, str]:
+    """ffprobe's view of one stream: rate, frame count and duration as it
+    stores them, not as OpenCV rounds them."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", stream,
+         "-show_entries", "stream=r_frame_rate,nb_frames,duration",
+         "-of", "default=noprint_wrappers=1", str(path)],
+        check=True, capture_output=True, text=True).stdout
+    return dict(line.split("=", 1) for line in out.splitlines())
 
 
 @pytest.fixture

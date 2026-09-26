@@ -70,7 +70,8 @@ class DerivedConfig:
     size can't drift apart mid-run. See docs/grid-and-sizing.md.
     """
 
-    src_fps: int
+    # Exact, never rounded: 29.97 as 30 drifts a frame every 33s.
+    src_fps: Fraction
     src_dimensions: tuple[int, int]
     src_frame_count: int
     # Smallest integer pair approximating the source's own aspect ratio.
@@ -79,7 +80,7 @@ class DerivedConfig:
     cell_size: tuple[int, int]
 
     @classmethod
-    def from_source(cls, config: UserConfig, *, fps: int,
+    def from_source(cls, config: UserConfig, *, fps: Fraction,
                     dimensions: tuple[int, int], frame_count: int,
                     tile_aspect: tuple[int, int] | None = None) -> "DerivedConfig":
         # Simplest integer pair near the source ratio, so 2.39:1 stays 2.39:1.
@@ -124,7 +125,7 @@ class DerivedConfig:
         return self.grid[1]
 
     @property
-    def output_fps(self) -> int:
+    def output_fps(self) -> Fraction:
         return self.src_fps
 
     @property
@@ -582,7 +583,8 @@ def probe_video(config: UserConfig,
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
 
-    fps = round(cap.get(cv2.CAP_PROP_FPS))
+    # A double of n/1001 snaps straight back. See docs/streaming-and-encoding.md.
+    fps = Fraction(cap.get(cv2.CAP_PROP_FPS)).limit_denominator(1001)
     dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                   int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     # Container metadata, used only as a tqdm display hint — may be inaccurate.
@@ -1010,6 +1012,7 @@ def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
                  output_path: Path) -> Path:
     """Pipe raw mosaic frames into ffmpeg and return the encoded file's path."""
     width, height = derived.target_dimensions
+    # str(Fraction) is "30000/1001", which ffmpeg takes as the exact rate.
     proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "rawvideo", "-pix_fmt", "bgr24",

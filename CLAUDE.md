@@ -80,7 +80,7 @@ User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
   `GalleryTooLarge` over this; over 1 GB it warns instead. Raise it if you really
   do have the RAM. See `docs/gallery-size.md`
 
-Everything derived from the source video — FPS, source/target dimensions, aspect
+Everything derived from the source video — FPS (a `Fraction`, never rounded, so 29.97 stays 30000/1001), source/target dimensions, aspect
 ratio, grid and cell size — lives in `DerivedConfig`, built once by
 `probe_video()` and immutable thereafter.
 
