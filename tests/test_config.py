@@ -165,3 +165,40 @@ def test_native_tiles_do_not_touch_single_frame_mode():
 def test_derivation_is_a_pure_function_of_its_inputs():
     """Same UserConfig and same source dimensions -> identical DerivedConfig."""
     assert derive(478, 200, grid_size=3) == derive(478, 200, grid_size=3)
+
+
+def test_1080p_native_widescreen_tiles_come_out_even():
+    """71 columns of 27px was 1917, which libx264 refuses under yuv420p. One
+    more column (1944) lands nearer 1920 than one fewer (1890)."""
+    derived = derive(1920, 1080, grid_size=8, tile_aspect=(16, 9))
+
+    assert derived.cell_size == (27, 15)
+    assert derived.target_dimensions == (1944, 1080)
+
+
+def test_an_odd_row_count_gives_way_on_the_height():
+    """720p at grid_size=3 was 27 rows of 27px, 729 high."""
+    derived = derive(1280, 720, grid_size=3)
+
+    assert derived.cell_size == (27, 27)
+    assert derived.target_dimensions == (1296, 702)
+
+
+def test_single_frame_mode_trims_the_cell_instead():
+    """The 1x1 grid can't give way, so the one cell loses a pixel."""
+    assert derive(853, 480, grid_size=1).target_dimensions == (852, 480)
+
+
+@pytest.mark.parametrize("tile_aspect", [None, (16, 9), (4, 3), (1, 1), (21, 9)])
+@pytest.mark.parametrize("grid_size", [1, 2, 3, 5, 8, 16])
+@pytest.mark.parametrize("dimensions", [(1920, 1080), (1280, 720), (853, 480),
+                                        (478, 200), (641, 359), (64, 48)])
+def test_target_dimensions_are_always_even(dimensions, grid_size, tile_aspect):
+    """No aspect check: at 3 columns a step is a third of the frame, so the
+    shape is only as good as the grid is fine. The cases above pin that."""
+    derived = derive(*dimensions, grid_size=grid_size, tile_aspect=tile_aspect)
+
+    width, height = derived.target_dimensions
+    assert width % 2 == 0 and height % 2 == 0
+    assert (width, height) == (derived.grid_x * derived.cell_size[0],
+                               derived.grid_y * derived.cell_size[1])

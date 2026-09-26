@@ -14,6 +14,7 @@ import pytest
 
 from conftest import CELL, make_frames, read_video, write_video
 from main import (BrightnessMetric, CifarGallery, DerivedConfig, UserConfig,
+                  VideoGallery,
                   build_metric, build_mosaics, combine_videos, encode_video,
                   gallery_brightness, main, mosaic_frame, probe_video)
 
@@ -135,6 +136,26 @@ def test_main_orchestrates_end_to_end(tmp_path, video, cifar_pickle, monkeypatch
     # depends on how the two containers' timestamps line up.
     assert len(decoded) >= len(frames)
     assert decoded.shape[1:3] == (height, width * 2)
+
+
+@needs_ffmpeg
+def test_main_encodes_1080p_against_widescreen_tiles(tmp_path, video_factory,
+                                                    monkeypatch):
+    """1080p at grid_size=8 against 16:9 tiles once sized to 1917x1080, and
+    libx264 won't open on an odd width. Real 1080p, since the odd side only
+    turns up at real resolutions."""
+    monkeypatch.chdir(tmp_path)  # keep the gallery cache out of the repo
+    source, frames = video_factory(count=3, width=1920, height=1080)
+    gallery_dir = tmp_path / "gallery"
+    gallery_dir.mkdir()
+    write_video(gallery_dir / "ep1.mkv", make_frames(20, 64, 36, seed=3))
+    config = UserConfig(input_dir=str(source), output_dir=str(tmp_path / "out"),
+                        grid_size=8)
+
+    combined = main(VideoGallery(gallery_dir, stride=1), config)
+
+    assert read_video(tmp_path / "out" / "output.mp4").shape == (3, 1080, 1944, 3)
+    assert read_video(combined).shape[1:3] == (1080, 1944 * 2)
 
 
 def _config(**kwargs) -> UserConfig:

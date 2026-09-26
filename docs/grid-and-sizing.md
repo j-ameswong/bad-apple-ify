@@ -1,7 +1,7 @@
 # Grid and sizing
 
 `DerivedConfig.from_source()` turns a source video's dimensions into a grid, a
-cell size, and a target frame size. Three decisions live in there.
+cell size, and a target frame size. Four decisions live in there.
 
 ## The aspect ratio comes from the source
 
@@ -47,3 +47,22 @@ The cell size is the source dimension divided by the grid, rounded, floored at
 cell, which is usually a pixel or two off the source. That's why
 `combine_videos()` rescales the source before stacking (see
 [streaming and encoding](streaming-and-encoding.md)).
+
+## Both sides come out even
+
+`encode_video()` asks libx264 for `yuv420p`, which halves the chroma both ways
+and so won't open on an odd width or height. Grid times cell is odd whenever
+both are, and that's not rare: 1080p at `grid_size=8` against 16:9 tiles was 71
+columns of 27px, 1917 wide, and 720p at `grid_size=3` was 27 rows of 27px.
+
+`even_span()` fixes a side by moving the count one step, never the cell, so a
+native tile keeps its shape. It takes whichever step lands nearer the ideal:
+1944 over 1890 for that 1080p case, since 1920 is 24 away from one and 30 from
+the other. Rows go first against the source height, then the columns against
+the width the new height implies, so a row that moves drags the width with it.
+Single-frame mode is the exception. Its 1x1 grid can't move, so the one cell
+gives up a pixel instead (853x480 becomes 852x480).
+
+A step is a whole cell, so on a coarse grid the fix costs shape. At 3 columns a
+step is a third of the frame. At the grid sizes worth running it's a few
+percent at most.

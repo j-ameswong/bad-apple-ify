@@ -49,6 +49,19 @@ class UserConfig:
     gallery_budget: int = HARD_BUDGET  # bytes of tiles to refuse past
 
 
+def even_span(count: int, cell: int, ideal: float) -> tuple[int, int]:
+    """(count, cell) with an even product, one step off if need be, nearest `ideal`.
+
+    The count takes the step so the cell keeps its shape, unless the count is
+    the single frame's 1. See docs/grid-and-sizing.md.
+    """
+    if count * cell % 2 == 0:
+        return count, cell
+    options = ([(count, c) for c in (cell - 1, cell + 1) if c > 0] if count == 1
+               else [(count - 1, cell), (count + 1, cell)])
+    return min(options, key=lambda o: (abs(o[0] * o[1] - ideal), o[0] * o[1]))
+
+
 @dataclass(frozen=True)
 class DerivedConfig:
     """Everything computed from a `UserConfig` once the source has been probed.
@@ -90,6 +103,13 @@ class DerivedConfig:
             cell_w = max(round(cell_h * tile_aspect[0] / tile_aspect[1]), 1)
             grid = (max(round(snapped_w / cell_w), 1), grid[1])
             cell_size = (cell_w, cell_h)
+
+        # yuv420p won't take an odd side. Rows first, then the width they imply.
+        rows, cell_h = even_span(grid[1], cell_size[1], dimensions[1])
+        height = rows * cell_h
+        cols, cell_w = even_span(grid[0], cell_size[0],
+                                 height * dimensions[0] / dimensions[1])
+        grid, cell_size = (cols, rows), (cell_w, cell_h)
 
         return cls(src_fps=fps, src_dimensions=dimensions,
                    src_frame_count=frame_count, aspect_ratio=aspect_ratio,
