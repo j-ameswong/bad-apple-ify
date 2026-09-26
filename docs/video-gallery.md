@@ -21,10 +21,25 @@ Each kept frame is shrunk to cell size before it is stored — see
 
 ## The tile buffer
 
-`load()` allocates `estimate_count()` tiles up front and fills them in place,
-doubling if the estimate was low. Each frame is written straight into the next
-free slot and only kept if it turns out to be new, so there is no scratch tile
-and no list of arrays to stack afterwards.
+`load()` hands `TileBuffer` the `estimate_count()` (or `FALLBACK_CAPACITY` when
+there isn't one), and the buffer allocates that many tiles up front, fills them
+in place and doubles if the estimate was low. Each frame is written straight
+into the next free slot and only kept if it turns out to be new, so there is no
+list of arrays to stack afterwards. The one exception is a full buffer, which
+hands out a one-tile scratch instead (see below).
+
+Every backing-buffer allocation, first and growth alike, goes through
+`TileBuffer._allocate()`, which prices it against `gallery_budget` and caps it
+at the most tiles the budget allows. So a lying container can't double its way
+to an OOM, and a doubling that would overshoot grows only as far as the budget
+instead of refusing a gallery that fits. It raises only when the next tile
+genuinely won't fit. The fallback guess used to be allocated unpriced, which at
+single-frame cell sizes on a 4K source was 25 GB of address space. The scratch
+tile and the trimming copy at the end sit outside that check.
+
+Growth waits for `keep()`, not `next_slot()`. That's what the scratch tile is
+for: a frame gets fitted and hashed before it asks for room, so a duplicate at
+the ceiling is dropped rather than refused.
 
 The buffer is copied down to size at the end when more than a tenth of it is
 unused. A bare slice would be free but would pin the whole allocation for the

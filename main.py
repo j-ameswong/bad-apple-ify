@@ -1,4 +1,4 @@
-from typing import Iterator, Literal, Protocol, cast
+from typing import Callable, Iterator, Literal, Protocol, cast
 import numpy as np
 import numpy.typing as npt
 import cv2
@@ -251,6 +251,53 @@ class CifarGallery:
         return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size, fit)
 
 
+class TileBuffer:
+    """Tiles written in place, doubling when full but never past `budget`.
+
+    `_allocate()` prices every backing-buffer allocation, and growth waits for
+    `keep()` so a duplicate never costs a slot. See docs/video-gallery.md.
+    """
+
+    def __init__(self, capacity: int, cell_size: tuple[int, int], budget: int):
+        cell_w, cell_h = cell_size
+        self._cell_size = cell_size
+        self._budget = budget
+        # The most tiles `enforce_gallery_budget()` lets through.
+        self._ceiling = (budget - 1) // (cell_h * cell_w * 3)
+        self._tiles = self._allocate(capacity, needed=1)
+        self._scratch: Image = np.empty((cell_h, cell_w, 3), dtype=np.uint8)
+        self.count = 0
+
+    def _allocate(self, wanted: int, needed: int) -> Image:
+        """Room for `wanted` tiles, capped at the budget. Raises if `needed` won't fit."""
+        enforce_gallery_budget(needed, self._cell_size, self._budget)
+        cell_w, cell_h = self._cell_size
+        return np.empty((min(wanted, self._ceiling), cell_h, cell_w, 3),
+                        dtype=np.uint8)
+
+    def next_slot(self) -> Image:
+        """Where the next tile goes: its slot, or the scratch tile when full."""
+        if self.count == len(self._tiles):
+            return self._scratch
+        slot: Image = self._tiles[self.count]
+        return slot
+
+    def keep(self) -> None:
+        """Keep whatever was just written to `next_slot()`, growing to fit it."""
+        if self.count == len(self._tiles):
+            # Both buffers are held over the copy, so half again, briefly.
+            grown = self._allocate(2 * self.count, needed=self.count + 1)
+            grown[:self.count] = self._tiles
+            grown[self.count] = self._scratch
+            self._tiles = grown
+        self.count += 1
+
+    def trimmed(self) -> Image:
+        """The kept tiles, copied down to size if a slice would pin much slack."""
+        kept: Image = self._tiles[:self.count]
+        return kept.copy() if self.count < 0.9 * len(self._tiles) else kept
+
+
 class VideoGallery:
     """Tiles decoded from a video (or a directory of them), keeping every
     `stride`-th frame. See docs/video-gallery.md."""
@@ -298,8 +345,9 @@ class VideoGallery:
     def estimate_count(self) -> int | None:
         """Frame count over stride, summed over the files. Upper bound.
 
-        Container metadata, so it can lie — fine for a warning, never for
-        sizing an allocation. Measured exact on the three rips to hand.
+        Container metadata, so it can lie — fine for a warning or a first
+        allocation, since `TileBuffer` re-prices anything past it. Measured
+        exact on the three rips to hand.
 
         Memoised: three call sites per load, and each one opens every file in
         the directory. A directory that changes mid-run gets a stale count,
@@ -335,58 +383,52 @@ class VideoGallery:
         costs more than decoding past the frames we don't want. `grab()` skips
         the colour conversion for those, which is most of them.
         """
-        cell_w, cell_h = cell_size
         files = self._files()
         if not files:
             raise ValueError(f"No videos found at {self._path}")
 
-        tiles = np.empty((self.estimate_count() or FALLBACK_CAPACITY,
-                          cell_h, cell_w, 3), dtype=np.uint8)
+        buffer = TileBuffer(self.estimate_count() or FALLBACK_CAPACITY,
+                            cell_size, budget)
         seen: set[bytes] = set()
-        kept = sampled = 0
+        sampled = 0
 
         with tqdm.tqdm(desc="Decoding gallery...", unit="frame",
                        total=self._frame_total()) as bar:
             for path in files:
                 cap = cv2.VideoCapture(str(path))
-                if not cap.isOpened():
-                    raise ValueError(f"Video at {path} could not be opened!")
-
-                index = 0
-                while cap.grab():
-                    if index % self._stride == 0:
-                        ok, frame = cap.retrieve()
-                        if ok:
-                            if kept == len(tiles):
-                                # The estimate was low, so re-price before
-                                # doubling — nothing else stands between a
-                                # lying container and an OOM. np.resize holds
-                                # both buffers over the copy, so the moment
-                                # costs half again on top.
-                                grown = 2 * len(tiles)
-                                enforce_gallery_budget(grown, cell_size, budget)
-                                tiles = np.resize(tiles, (grown, cell_h,
-                                                          cell_w, 3))
-                            # Written straight into its slot, then kept or not:
-                            # a scratch tile per frame would be the only copy.
-                            # cv2's stubs won't commit to a dtype; decode is uint8.
-                            fit_to_cell(cast(Image, frame), cell_size, fit,
-                                        dst=tiles[kept])
-                            digest = hashlib.blake2b(tiles[kept].tobytes(),
-                                                     digest_size=8).digest()
-                            sampled += 1
-                            if digest not in seen:
-                                seen.add(digest)
-                                kept += 1
-                    index += 1
-                    bar.update()
-                cap.release()
+                try:
+                    if not cap.isOpened():
+                        raise ValueError(f"Video at {path} could not be opened!")
+                    for frame in self._sampled_frames(cap, bar.update):
+                        # Fitted into the slot itself, then kept or not.
+                        slot = buffer.next_slot()
+                        fit_to_cell(frame, cell_size, fit, dst=slot)
+                        sampled += 1
+                        digest = hashlib.blake2b(slot.tobytes(),
+                                                 digest_size=8).digest()
+                        if digest not in seen:
+                            seen.add(digest)
+                            buffer.keep()
+                finally:
+                    cap.release()
 
         print(f"Sampled {sampled} frames from {len(files)} file(s) -> "
-              f"{kept} tiles ({sampled - kept} duplicates dropped)")
-        # A slice would pin the whole buffer, and dedupe can leave most of it
-        # empty. Copying costs a moment's double-hold to give the rest back.
-        return tiles[:kept].copy() if kept < 0.9 * len(tiles) else tiles[:kept]
+              f"{buffer.count} tiles ({sampled - buffer.count} duplicates dropped)")
+        return buffer.trimmed()
+
+    def _sampled_frames(self, cap: cv2.VideoCapture,
+                        tick: Callable[[], object]) -> Iterator[Image]:
+        """Every `stride`-th frame of an open capture, ticking once per frame
+        decoded. The caller releases the capture."""
+        index = 0
+        while cap.grab():
+            if index % self._stride == 0:
+                ok, frame = cap.retrieve()
+                if ok:
+                    # cv2's stubs won't commit to a dtype; decode is uint8.
+                    yield cast(Image, frame)
+            index += 1
+            tick()
 
     def _frame_total(self) -> int | None:
         """Frames to be decoded, for the progress bar. Metadata, so a hint only."""

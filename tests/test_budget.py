@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 
 from conftest import CELL, make_frames, write_video
+import main
 from main import (CifarGallery, DerivedConfig, GalleryTooLarge, HARD_BUDGET,
-                  VideoGallery, check_gallery_budget, format_bytes,
+                  TileBuffer, VideoGallery, check_gallery_budget, format_bytes,
                   load_gallery)
 
 
@@ -111,6 +112,102 @@ def test_a_lying_estimate_is_caught_on_the_way_up(tmp_path, monkeypatch):
     # One 4x4 tile is 48 B, so a budget of 96 B stops the first doubling.
     with pytest.raises(GalleryTooLarge):
         source.load(CELL, "stretch", budget=96)
+
+
+def test_a_refused_load_still_releases_the_capture(tmp_path, monkeypatch):
+    """The refusal comes from inside the decode loop, so it has to go through
+    the `finally` rather than leak an open file."""
+    path = tmp_path / "gallery.mkv"
+    write_video(path, make_frames(20, 16, 16))
+    released = []
+    real_capture = main.cv2.VideoCapture
+
+    class TrackingCapture:
+        def __init__(self, name):
+            self._cap = real_capture(name)
+
+        def __getattr__(self, attr):
+            return getattr(self._cap, attr)
+
+        def release(self):
+            released.append(True)
+            self._cap.release()
+
+    monkeypatch.setattr(main.cv2, "VideoCapture", TrackingCapture)
+    source = VideoGallery(path, stride=1)
+    monkeypatch.setattr(source, "estimate_count", lambda: 1)
+
+    with pytest.raises(GalleryTooLarge):
+        source.load(CELL, "stretch", budget=96)
+    assert released == [True]
+
+
+def test_growth_stops_at_the_budget_rather_than_overshooting():
+    """Doubling 3 tiles to 6 would be 288 B against a 200 B budget, but a
+    fourth tile (192 B) fits, so it grows to that instead of refusing."""
+    buffer = TileBuffer(3, CELL, budget=200)
+    for _ in range(4):
+        buffer.next_slot()[:] = 7
+        buffer.keep()
+
+    assert buffer.trimmed().shape == (4, 4, 4, 3)
+    buffer.next_slot()[:] = 7
+    with pytest.raises(GalleryTooLarge):
+        buffer.keep()
+
+
+def test_growth_carries_the_tiles_already_kept():
+    buffer = TileBuffer(1, CELL, budget=HARD_BUDGET)
+    for value in range(5):
+        buffer.next_slot()[:] = value
+        buffer.keep()
+
+    assert [int(tile[0, 0, 0]) for tile in buffer.trimmed()] == list(range(5))
+
+
+def solid_frames(*values: int) -> np.ndarray:
+    """One flat 16x16 frame per value, so equal values dedupe to one tile."""
+    return np.stack([np.full((16, 16, 3), v, dtype=np.uint8) for v in values])
+
+
+def unknown_count_gallery(tmp_path, monkeypatch, frames) -> VideoGallery:
+    path = tmp_path / "gallery.mkv"
+    write_video(path, frames)
+    source = VideoGallery(path, stride=1)
+    monkeypatch.setattr(source, "estimate_count", lambda: None)
+    return source
+
+
+def test_duplicates_at_the_budget_ceiling_still_load(tmp_path, monkeypatch):
+    """One 4x4 tile is 48 B, so 49 B holds exactly one. The repeats are
+    dropped before they need a slot, so they can't trip the budget."""
+    source = unknown_count_gallery(tmp_path, monkeypatch, solid_frames(9, 9, 9))
+
+    assert len(source.load(CELL, "stretch", budget=49)) == 1
+
+
+def test_a_new_tile_past_the_budget_ceiling_is_refused(tmp_path, monkeypatch):
+    source = unknown_count_gallery(tmp_path, monkeypatch, solid_frames(9, 9, 200))
+
+    with pytest.raises(GalleryTooLarge):
+        source.load(CELL, "stretch", budget=49)
+
+
+def test_an_unknown_count_loads_under_a_budget_its_fallback_would_blow(
+        tmp_path, monkeypatch):
+    """FALLBACK_CAPACITY tiles would be 48 KB; 20 tiles fit in under 1 KB."""
+    source = unknown_count_gallery(tmp_path, monkeypatch,
+                                   make_frames(20, 16, 16))
+
+    assert len(source.load(CELL, "stretch", budget=20 * 48 + 1)) == 20
+
+
+def test_an_unknown_count_is_refused_when_not_one_tile_fits(tmp_path,
+                                                            monkeypatch):
+    source = unknown_count_gallery(tmp_path, monkeypatch, solid_frames(9))
+
+    with pytest.raises(GalleryTooLarge):
+        source.load(CELL, "stretch", budget=48)
 
 
 def test_the_estimate_is_only_scanned_once(tmp_path):
