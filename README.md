@@ -58,15 +58,29 @@ rm -rf cifar-100-python cifar-100-python.tar.gz
 
 The script will output the mosaic video and a combined side-by-side version in `./output/`.
 
+To try a ten-second slice starting one minute into the source:
+
+```bash
+uv run main.py --start 60 --duration 10
+```
+
+Both outputs, including the combined video's audio, use that slice. Times are
+in seconds and can be fractional. Omit `--start` to begin at zero, or omit
+`--duration` to continue to the end. See [streaming and slicing](docs/streaming-and-encoding.md)
+for frame boundaries and how seeded tile choices are preserved.
+
 ## Configuration
 
-All the tweakable parameters live in the `Config` dataclass at the top of `main.py`:
+The parameters live in the `UserConfig` dataclass in `main.py`. `parse_config()`
+constructs the command-line defaults; `--start` and `--duration` override its
+slice settings. Other settings can be changed there until the full CLI lands.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `grid_size` | 16 | Multiplier for aspect ratio |
+| `grid_size` | 8 | Multiplier for aspect ratio |
 | `contrast` | 1.0 | Gallery brightness range (0–1). Lower values trim dark/bright extremes |
-| `img_format` | `png` | Format for intermediate frames (`png` or `jpg`) |
+| `start` | `0` | First source time to process, in seconds |
+| `duration` | `None` | Seconds to process; `None` continues to the end |
 
 Higher grid values = more tiles = finer detail but slower processing. The grid is independent of the source resolution, the cell size is calculated automatically.
 

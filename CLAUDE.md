@@ -42,10 +42,16 @@ aliases at the top of `main.py` rather than `np.ndarray`, which under strict is
 ## Configuration
 
 User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
-`main.py`, and are constructed in the `__main__` block. Edit that to change them:
+`main.py`, and are constructed in `parse_config()`. Edit that to change them;
+`--start` and `--duration` already have CLI flags:
 
 - `input_dir` / `output_dir` — source video and output folder paths (the gallery
   path is not a config field — it belongs to the `GallerySource` passed to `main()`)
+- `start` / `duration` — source seconds to process, default zero / to EOF.
+  `uv run main.py --start 60 --duration 10` selects frames 1800–2099 at 30 fps.
+  The skipped prefix replays random tile choices when `candidates > 1`, so a
+  slice matches the full run. Both the source pane and audio are trimmed too.
+  See `docs/streaming-and-encoding.md`
 - `grid_size` — multiplier for aspect ratio (higher = more tiles = finer detail,
   slower). `grid_size=1` is single-frame mode: the grid collapses to 1×1 and each
   source frame is replaced by one whole gallery image. No separate code path —
@@ -101,7 +107,7 @@ The entire pipeline is single-file (`main.py`):
 7. **`mosaic_frame()`** — assembles the matched tiles into a single mosaic frame; **`build_mosaics()`** maps it lazily over the frame stream (one frame in, one mosaic out, so peak memory never scales with video length)
 8. **`build_metric()`** — steps 4–6 as one stage: brightness, shrink, then `precompute()` on whichever `Metric` `config.metric` names, wrapped in `SteadyMetric` unless `hold_tiles` is off
 9. **`encode_video()`** — owns the ffmpeg pipe, writing raw mosaic frames to its stdin; **`combine_videos()`** runs ffmpeg again for the side-by-side output, scaling the source to the mosaic's size (`hstack` demands equal heights and the two only match by coincidence)
-10. **`main(gallery_source, config)`** — pure orchestration, no logic of its own: probe → load → build metric → stream → mosaic → encode → combine. It takes a `GallerySource` and never touches CIFAR-specific code; the `UserConfig` is built at the call site in `__main__`
+10. **`main(gallery_source, config)`** — orchestration: probe → load → build metric → stream → mosaic → encode → combine. It takes a `GallerySource` and never touches CIFAR-specific code; `parse_config()` builds the `UserConfig` for `__main__`
 
 ## Dependencies
 

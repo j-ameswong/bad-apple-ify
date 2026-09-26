@@ -8,7 +8,42 @@ the source is. Holding a 130k-frame film at 512x384 would be 76 GB, so this
 isn't a tidiness thing.
 
 `DerivedConfig.src_frame_count` comes from container metadata and may be wrong
-or absent. It's only ever used as a tqdm total hint.
+or absent. It's only ever used as a tqdm total hint; `output_frame_count`
+adjusts that hint for the requested slice.
+
+## Processing a slice
+
+`uv run main.py --start 60 --duration 10` processes source seconds 60–70.
+Both flags accept fractional seconds. `start` defaults to zero; leaving out
+`duration` runs to EOF. The same fields are available on `UserConfig`.
+Negative or non-finite starts, and non-positive or non-finite durations, are
+rejected before opening the source or gallery.
+
+Frames are selected by their timestamps in `[start, start + duration)`. The
+first index is `ceil(start × fps)` and the exclusive end is
+`ceil((start + duration) × fps)`, calculated with fractions. At 30 fps, 60–70
+seconds means exactly frames 1800–2099. At fractional rates or between frame
+boundaries, the slice is rounded to whole frames and the audio follows those
+boundaries. EOF can shorten a slice; source frame-count metadata never limits
+the decode. An empty range raises a clear error before ffmpeg starts.
+
+Decoding counts frames sequentially, so an inaccurate container index cannot
+seek to the wrong picture. With multiple candidates, the prefix also goes
+through `metric.match()` to replay its random draws and held tiles. Those
+prefix frames are neither assembled nor encoded. This makes even a seeded,
+stochastic slice byte-identical to the corresponding **raw mosaics** of a full
+run. It does cost a decode and match of the prefix; `candidates=1` only grabs
+the skipped frames and avoids resizing and matching them. Memory stays bounded.
+
+The source pane is trimmed by the same frame indices. Both panes are put on
+the mosaic's frame clock before stacking, avoiding extra frames from container
+timestamp rounding. Audio is explicitly taken from the source's first audio
+track, trimmed to the same start and the completed mosaic's actual duration,
+and rebased to zero. Silent sources work too. This also keeps audio short when
+the requested duration extends past EOF.
+
+Only these two flags are exposed so far. The remaining CLI and TOML config
+layering are still PLAN.md 2.8.
 
 ## The encode pipe
 

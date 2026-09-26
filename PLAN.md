@@ -630,6 +630,15 @@ iteration on everything above.
 **Testable when:** `--start 60 --duration 10` on a 30 fps source produces
 exactly 300 frames, matching frames 1800–2099 of a full run.
 
+**Landed.** `start` / `duration` on `UserConfig`, exposed as CLI flags.
+`DerivedConfig` turns seconds into an inclusive start frame and exclusive stop
+frame using the exact source rate. Streaming stops at the requested end or
+real EOF, and the source pane and audio are trimmed to the completed mosaic.
+The skipped prefix replays matching when stochastic choices need their history,
+so the raw mosaic frames match a full run even with held tiles enabled.
+Notes in `docs/streaming-and-encoding.md`; `tests/test_slice.py` checks the
+300-frame example, seeded matching, fractional rates, EOF and audio alignment.
+
 ---
 
 ### 2.8 CLI + config file

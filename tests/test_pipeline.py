@@ -155,10 +155,8 @@ def test_main_orchestrates_end_to_end(tmp_path, video, cifar_pickle, monkeypatch
     assert len(read_video(tmp_path / "out" / "output.mp4")) == len(frames)
 
     decoded = read_video(combined)
-    # hstack holds the last frame of whichever input runs out first, so the
-    # combined length is only bounded below by the source's — the exact count
-    # depends on how the two containers' timestamps line up.
-    assert len(decoded) >= len(frames)
+    # Both panes use the same frame clock, even across different containers.
+    assert len(decoded) == len(frames)
     assert decoded.shape[1:3] == (height, width * 2)
 
 

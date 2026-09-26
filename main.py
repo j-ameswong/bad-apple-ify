@@ -1,4 +1,5 @@
 from typing import Callable, Iterator, Literal, Protocol, cast
+import argparse
 import numpy as np
 import numpy.typing as npt
 import cv2
@@ -9,6 +10,8 @@ import pickle
 import tokenize
 import warnings
 from fractions import Fraction
+from itertools import chain, islice
+from math import ceil, isfinite
 from pathlib import Path
 from dataclasses import dataclass
 import subprocess
@@ -46,6 +49,15 @@ class UserConfig:
     seed: int = 0
     hold_tiles: bool = True  # keep a cell's tile while its bucket is unchanged
     gallery_budget: int = HARD_BUDGET  # bytes of tiles to refuse past
+    start: float = 0.0  # source seconds, inclusive
+    duration: float | None = None  # source seconds; None runs to EOF
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.start) or self.start < 0:
+            raise ValueError("start must be a finite, non-negative number of seconds")
+        if self.duration is not None and (not isfinite(self.duration)
+                                          or self.duration <= 0):
+            raise ValueError("duration must be a finite, positive number of seconds")
 
 
 def even_span(count: int, cell: int, ideal: float) -> tuple[int, int]:
@@ -76,11 +88,22 @@ class DerivedConfig:
     aspect_ratio: tuple[int, int]
     grid: tuple[int, int]
     cell_size: tuple[int, int]
+    start_frame: int = 0
+    stop_frame: int | None = None  # exclusive; never clipped to source metadata
 
     @classmethod
     def from_source(cls, config: UserConfig, *, fps: Fraction,
                     dimensions: tuple[int, int], frame_count: int,
                     tile_aspect: tuple[int, int] | None = None) -> "DerivedConfig":
+        if fps <= 0:
+            raise ValueError("source frame rate must be positive")
+        # Keep frame timestamps in [start, start + duration), including at NTSC rates.
+        start = Fraction(str(config.start))
+        start_frame = ceil(start * fps)
+        stop_frame = (None if config.duration is None else
+                      ceil((start + Fraction(str(config.duration))) * fps))
+        if stop_frame is not None and stop_frame <= start_frame:
+            raise ValueError("the requested source range contains no frames")
         # Simplest integer pair near the source ratio, so 2.39:1 stays 2.39:1.
         ratio = Fraction(*dimensions).limit_denominator(16)
         aspect_ratio = (ratio.numerator, ratio.denominator)
@@ -111,7 +134,8 @@ class DerivedConfig:
 
         return cls(src_fps=fps, src_dimensions=dimensions,
                    src_frame_count=frame_count, aspect_ratio=aspect_ratio,
-                   grid=grid, cell_size=cell_size)
+                   grid=grid, cell_size=cell_size,
+                   start_frame=start_frame, stop_frame=stop_frame)
 
     @property
     def grid_x(self) -> int:
@@ -124,6 +148,16 @@ class DerivedConfig:
     @property
     def output_fps(self) -> Fraction:
         return self.src_fps
+
+    @property
+    def output_frame_count(self) -> int | None:
+        """Progress hint for the slice, still subject to bad source metadata."""
+        remaining = (max(self.src_frame_count - self.start_frame, 0)
+                     if self.src_frame_count > 0 else None)
+        if self.stop_frame is None:
+            return remaining
+        requested = self.stop_frame - self.start_frame
+        return requested if remaining is None else min(requested, remaining)
 
     @property
     def target_dimensions(self) -> tuple[int, int]:
@@ -620,20 +654,32 @@ def probe_video(config: UserConfig,
     return derived
 
 
-def stream_frames(config: UserConfig, derived: DerivedConfig) -> Iterator[Image]:
-    """Decode and yield source frames one at a time, resized to target dimensions."""
+def stream_frames(config: UserConfig, derived: DerivedConfig, *,
+                  include_prefix: bool = False) -> Iterator[Image]:
+    """Yield the selected source frames, or their prefix too for metric warm-up.
+
+    Count decoded frames rather than trusting frame seeks or container totals.
+    See docs/streaming-and-encoding.md.
+    """
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
         raise ValueError(f"Video at {config.input_dir} not found!")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # cv2's stubs won't commit to a dtype, but resize keeps the input's.
-        yield cast(Image, cv2.resize(frame, derived.target_dimensions))
-
-    cap.release()
+    try:
+        first = 0 if include_prefix else derived.start_frame
+        for _ in range(first):
+            if not cap.grab():
+                return
+        index = first
+        while derived.stop_frame is None or index < derived.stop_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # cv2's stubs won't commit to a dtype, but resize keeps the input's.
+            yield cast(Image, cv2.resize(frame, derived.target_dimensions))
+            index += 1
+    finally:
+        cap.release()
 
 
 class Metric(Protocol):
@@ -997,20 +1043,29 @@ def build_metric(gallery: Image, config: UserConfig,
 
 
 def build_mosaics(frames: Iterator[Image], metric: Metric,
-                  derived: DerivedConfig) -> Iterator[Image]:
+                  derived: DerivedConfig, *, warmup_frames: int = 0) -> Iterator[Image]:
     """Turn a stream of source frames into a stream of mosaics.
 
     Lazy end to end: one frame in, one mosaic out, so peak memory holds a couple
     of frames however long the source is.
     """
+    if warmup_frames:
+        for frame in tqdm.tqdm(islice(frames, warmup_frames),
+                               desc="Replaying tile choices...", total=warmup_frames):
+            metric.match(frame)
     for frame in tqdm.tqdm(frames, desc="Building mosaics...",
-                           total=derived.src_frame_count or None):
+                           total=derived.output_frame_count):
         yield mosaic_frame(frame, metric)
 
 
 def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
                  output_path: Path) -> Path:
     """Pipe raw mosaic frames into ffmpeg and return the encoded file's path."""
+    first = next(mosaics, None)
+    if first is None:
+        raise ValueError("the requested source range contains no frames")
+    mosaics = chain((first,), mosaics)
+    del first
     width, height = derived.target_dimensions
     # str(Fraction) is "30000/1001", which ffmpeg takes as the exact rate.
     proc = subprocess.Popen([
@@ -1040,20 +1095,40 @@ def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
 
 def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
                    dimensions: tuple[int, int],
-                   total_frames: int = 0) -> Path:
+                   total_frames: int = 0, *, start_frame: int = 0) -> Path:
     """Stack the source and its mosaic side by side into one video.
 
     The source is scaled to the mosaic's size: `hstack` needs equal heights, and
     the two only match by coincidence. See docs/streaming-and-encoding.md.
     """
     width, height = dimensions
+    # This is our completed encode, so its count is the actual slice length,
+    # even when the source ended before the requested duration.
+    cap = cv2.VideoCapture(str(mosaic_path))
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = Fraction(cap.get(cv2.CAP_PROP_FPS)).limit_denominator(1001)
+    finally:
+        cap.release()
+    if count <= 0 or fps <= 0:
+        raise ValueError(f"No mosaic frames found at {mosaic_path}")
+    start_seconds = f"{float(start_frame / fps):.9f}"
+    duration_seconds = f"{float(count / fps):.9f}"
+    # Both panes use the same frame clock; mkv timestamps round to milliseconds.
+    clock = f"settb=expr=1/({fps}),setpts=N"
     proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-progress", "pipe:1",
         "-i", str(source_path),
         "-i", str(mosaic_path),
         "-filter_complex",
-        f"[0:v]scale={width}:{height},setsar=1[src];[src][1:v]hstack=inputs=2",
+        f"[0:v:0]trim=start_frame={start_frame}:end_frame={start_frame + count},"
+        f"scale={width}:{height},setsar=1,{clock}[src];"
+        f"[1:v:0]{clock}[mosaic];[src][mosaic]hstack=inputs=2:shortest=1[out]",
+        "-map", "[out]", "-map", "0:a:0?",
+        "-af", f"atrim=start={start_seconds}:duration={duration_seconds},asetpts=PTS-STARTPTS",
+        "-t", duration_seconds,
+        "-r", str(fps),
         "-c:v", "libx264",
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
@@ -1092,23 +1167,39 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
                      budget=config.gallery_budget),
         config, derived)
 
-    frames = stream_frames(config, derived)
-    mosaics = build_mosaics(frames, metric, derived)
+    # Reproduce the full run's RNG and held tiles, without assembling its prefix.
+    warmup = derived.start_frame if config.candidates > 1 else 0
+    frames = stream_frames(config, derived, include_prefix=bool(warmup))
+    mosaics = build_mosaics(frames, metric, derived, warmup_frames=warmup)
     mosaic_path = encode_video(mosaics, derived, output_dir / "output.mp4")
 
     combined = combine_videos(Path(config.input_dir), mosaic_path,
                               output_dir / "combined.mp4",
                               derived.target_dimensions,
-                              derived.src_frame_count)
+                              derived.output_frame_count or 0,
+                              start_frame=derived.start_frame)
     print(f"Done. Output written to ./{output_dir}/")
     return combined
+
+
+def parse_config(argv: list[str] | None = None) -> UserConfig:
+    """The slice flags; the rest of the CLI/config layering is PLAN.md 2.8."""
+    parser = argparse.ArgumentParser(description="Rebuild a source video as a photo mosaic.")
+    parser.add_argument("--start", type=float, default=0.0, metavar="SECONDS",
+                        help="source start time in seconds (default: 0)")
+    parser.add_argument("--duration", type=float, metavar="SECONDS",
+                        help="seconds of source to process (default: to the end)")
+    args = parser.parse_args(argv)
+    try:
+        return UserConfig(input_dir="./assets/source.mp4", output_dir="./output/",
+                          contrast=1.0, grid_size=8,
+                          start=args.start, duration=args.duration)
+    except ValueError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
     # Swap in VideoGallery(Path("./assets/videos"), stride=10) for your own
     # videos. CIFAR stays the default because the README has you download it.
     main(CifarGallery(Path("./assets/gallery/train")),
-         UserConfig(input_dir="./assets/source.mp4",
-                    output_dir="./output/",
-                    contrast=1.0,
-                    grid_size=8))
+         parse_config())
