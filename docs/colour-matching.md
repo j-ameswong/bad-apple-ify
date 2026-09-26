@@ -131,5 +131,8 @@ Against 50k tiles at a 16x16 cell, 512x384 output:
 
 Both are dominated by `cell_means()`, which reduces one axis at a time rather
 than in a single `.mean(axis=(1, 3))` — the strided uint8 reduction over both
-axes at once costs 10x as much, and summing in uint32 gives the identical
-answer.
+axes at once costs 10x as much (2.7 ms a frame against 0.26 at 512x384), and
+summing in uint32 gives the identical answer.
+
+It's a reshape, so the mean is exact. `cv2.resize(..., INTER_AREA)` does the
+same job to within 0.5/255 if you ever need the speed instead.

@@ -13,7 +13,6 @@ from pathlib import Path
 from dataclasses import dataclass
 import subprocess
 
-# A bare np.ndarray is ndarray[Any, dtype[Any]], which says nothing.
 type Image = npt.NDArray[np.uint8]
 type Brightness = npt.NDArray[np.float64]
 type Indices = npt.NDArray[np.int64]
@@ -21,15 +20,14 @@ type Indices = npt.NDArray[np.int64]
 # How a gallery image fills a cell it doesn't share a shape with.
 type Fit = Literal["native", "crop", "stretch"]
 
-# Which `Metric` a run matches with.
 type MetricName = Literal["brightness", "colour"]
 
 # Rec.601 luma weights in BGR order — what cv2.COLOR_BGR2GRAY applies.
 LUMA_BGR = np.array([0.114, 0.587, 0.299])
 
 # Tile-array sizes to warn at and to stop at. See docs/gallery-size.md.
-SOFT_BUDGET = 1 << 30  # 1 GB
-HARD_BUDGET = 8 << 30  # 8 GB
+SOFT_BUDGET = 1 << 30
+HARD_BUDGET = 8 << 30
 
 
 @dataclass(frozen=True)
@@ -75,7 +73,6 @@ class DerivedConfig:
     src_fps: Fraction
     src_dimensions: tuple[int, int]
     src_frame_count: int
-    # Smallest integer pair approximating the source's own aspect ratio.
     aspect_ratio: tuple[int, int]
     grid: tuple[int, int]
     cell_size: tuple[int, int]
@@ -91,15 +88,12 @@ class DerivedConfig:
         grid = ((1, 1) if config.grid_size == 1
                 else (aspect_ratio[0] * config.grid_size,
                       aspect_ratio[1] * config.grid_size))
-        # Nearest whole multiple of the grid, at least 1px per cell.
         cell_size = (max(round(dimensions[0] / grid[0]), 1),
                      max(round(dimensions[1] / grid[1]), 1))
 
         if tile_aspect is not None and config.grid_size > 1:
-            # Rows stay put, the cell takes the tiles' ratio, and the columns are
-            # however many then fit across. Across the *snapped* width, mind —
-            # the raw source width stopped sharing a scale with the cell the
-            # moment the rows rounded. See docs/grid-and-sizing.md.
+            # Columns fit the *snapped* width: the raw one stopped sharing a
+            # scale with the cell once the rows rounded. See docs/tile-shape.md.
             cell_h = cell_size[1]
             snapped_w = grid[0] * cell_size[0]
             cell_w = max(round(cell_h * tile_aspect[0] / tile_aspect[1]), 1)
@@ -181,9 +175,10 @@ def crop_to_aspect(image: Image, cell_size: tuple[int, int]) -> Image:
     """The largest centred rectangle of `image` with the cell's aspect ratio."""
     cell_w, cell_h = cell_size
     h, w = image.shape[:2]
-    if w * cell_h > h * cell_w:  # too wide — trim the sides
+    too_wide = w * cell_h > h * cell_w
+    if too_wide:
         crop_w, crop_h = max(round(h * cell_w / cell_h), 1), h
-    else:  # too tall — trim top and bottom
+    else:
         crop_w, crop_h = w, max(round(w * cell_h / cell_w), 1)
     x, y = (w - crop_w) // 2, (h - crop_h) // 2
     return image[y:y + crop_h, x:x + crop_w]
@@ -191,17 +186,15 @@ def crop_to_aspect(image: Image, cell_size: tuple[int, int]) -> Image:
 
 def fit_to_cell(image: Image, cell_size: tuple[int, int], fit: Fit = "native",
                 dst: Image | None = None) -> Image:
-    """Shrink one image to cell size, cropping first unless asked to stretch.
+    """Resize one image to cell size, cropping first unless asked to stretch.
 
     Under `native` the cell already carries the tiles' ratio, so the crop is a
     no-op — except in single-frame mode, where the cell is the source frame.
     """
     source = image if fit == "stretch" else crop_to_aspect(image, cell_size)
     src_h, src_w = source.shape[:2]
-    # Bilinear reads a 2x2 neighbourhood, so 1080p into a 14x8 tile samples the
-    # frame rather than averaging it and the brightness lands nowhere near the
-    # truth. AREA averages, but degenerates to nearest going up (single-frame
-    # mode blows 32x32 CIFAR up to the whole frame), hence the switch.
+    # Shrinking, bilinear samples a 2x2 patch where AREA averages; growing, AREA
+    # is nearest-neighbour. See docs/tile-shape.md.
     shrinking = cell_size[0] <= src_w and cell_size[1] <= src_h
     # dst= needs an exact shape and dtype match or cv2 quietly drops the write.
     return cast(Image, cv2.resize(
@@ -223,10 +216,8 @@ def resize_gallery_to_cells(gallery: Image, cell_size: tuple[int, int],
     return tiles
 
 
-# One CIFAR image on disk: 32*32*3 planar uint8.
-CIFAR_IMAGE_BYTES = 3072
+CIFAR_IMAGE_BYTES = 32 * 32 * 3
 
-# What a directory gallery counts as a video.
 VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"})
 
 # Tiles to allocate room for when a video source can't say how many there'll be.
@@ -244,9 +235,9 @@ def read_cifar_batch(path: Path) -> Image:
         images = data['data']
 
         # reminder to self, transpose works by putting in the old positions
-        temp = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+        rgb = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
         # Faster to resize from, not required by cv2. See docs/gallery-sources.md.
-        return np.ascontiguousarray(temp[..., ::-1])  # RGB -> BGR
+        return np.ascontiguousarray(rgb[..., ::-1])
 
 
 class CifarGallery:
@@ -369,13 +360,8 @@ class VideoGallery:
     def estimate_count(self) -> int | None:
         """Frame count over stride, summed over the files. Upper bound.
 
-        Container metadata, so it can lie — fine for a warning or a first
-        allocation, since `TileBuffer` re-prices anything past it. Measured
-        exact on the three rips to hand.
-
-        Memoised: three call sites per load, and each one opens every file in
-        the directory. A directory that changes mid-run gets a stale count,
-        which costs a resize at worst.
+        Memoised. Container metadata, so it can lie, but `TileBuffer` re-prices
+        anything past it. See docs/video-gallery.md.
         """
         if not self._counted:
             self._count = self._scan_count()
@@ -403,9 +389,8 @@ class VideoGallery:
              budget: int = HARD_BUDGET) -> Image:
         """Decode every file in order, keeping one frame in `stride`, deduped.
 
-        Straight through, no seeking: frame-accurate seek on long-GOP video
-        costs more than decoding past the frames we don't want. `grab()` skips
-        the colour conversion for those, which is most of them.
+        Straight through, no seeking: a frame-accurate seek on long-GOP video
+        costs more than decoding past what we skip. See docs/video-gallery.md.
         """
         files = self._files()
         if not files:
@@ -424,7 +409,6 @@ class VideoGallery:
                     if not cap.isOpened():
                         raise ValueError(f"Video at {path} could not be opened!")
                     for frame in self._sampled_frames(cap, bar.update):
-                        # Fitted into the slot itself, then kept or not.
                         slot = buffer.next_slot()
                         fit_to_cell(frame, cell_size, fit, dst=slot)
                         sampled += 1
@@ -463,9 +447,8 @@ class VideoGallery:
 DEFAULT_CACHE_DIR = Path(".cache/gallery")
 
 
-# Bump when the pixels a given (source, cell, fit) produces change — v2 is the
-# INTER_AREA switch in `fit_to_cell()`. Nothing in the key covers resampling,
-# so without this a stale cache serves the old tiles forever.
+# Bump when the same (source, cell, fit) starts giving different pixels: the key
+# can't see how the resize was done. See docs/gallery-cache.md.
 TILE_VERSION = 2
 
 
@@ -491,11 +474,7 @@ def format_bytes(size: float) -> str:
 
 def enforce_gallery_budget(count: int, cell_size: tuple[int, int],
                            budget: int = HARD_BUDGET) -> int:
-    """Price a tile array of `count` tiles, raising if it's over budget.
-
-    Called on the estimate up front, and again by a source that outgrows its
-    estimate mid-decode — the estimate is container metadata and metadata lies.
-    """
+    """Price a tile array of `count` tiles, raising if it's over budget."""
     cell_w, cell_h = cell_size
     size = count * cell_h * cell_w * 3
     if size >= budget:
@@ -583,7 +562,6 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
     path = cache_dir / f"tiles-{cache_key(source, cell_size, fit)}.npy"
     if use_cache and path.exists():
         cached = read_cached_tiles(path, cell_size, budget)
-        # A truncated or hand-edited file isn't worth trusting over a re-decode.
         if cached is not None:
             print(f"Gallery cache hit: {path} ({len(cached)} tiles, "
                   f"{format_bytes(cached.nbytes)})")
@@ -715,12 +693,8 @@ def check_cell_size(gallery: Image, cell_size: tuple[int, int]) -> None:
 def cell_means(image: Image, cell_size: tuple[int, int]) -> npt.NDArray[np.float64]:
     """Per-cell mean of every channel: (H, W, ...) -> (grid_y, grid_x, ...).
 
-    A reshape, so it's the exact mean — `cv2.resize(..., INTER_AREA)` is the
-    same operation to within 0.5/255 if you ever need the speed instead.
-
-    The two axes come off one at a time because a single `.mean(axis=(1, 3))`
-    over a strided uint8 block costs 10x as much (2.7 ms a frame against 0.26 at
-    512x384), and integers summed in uint32 make it the identical answer.
+    Exact, and taken one axis at a time: a single `.mean(axis=(1, 3))` over the
+    strided uint8 block costs 10x as much. See docs/colour-matching.md.
     """
     cell_w, cell_h = cell_size
     h, w = image.shape[:2]
@@ -734,9 +708,8 @@ def cell_means(image: Image, cell_size: tuple[int, int]) -> npt.NDArray[np.float
 def compact_buckets(lo: Indices, count: Indices, n: int) -> tuple[Indices, Indices]:
     """Which of `n` sorted tiles some bucket reaches, and where each one lands.
 
-    Coverage of the `[lo, lo + count)` spans, counted with a difference array.
-    Returns the reachable positions and a map from sorted position to its index
-    in the compacted tile array, so `match()` can index `tiles` directly.
+    Returns (reachable positions, sorted position -> compacted index), counting
+    coverage of the `[lo, lo + count)` spans with a difference array.
     """
     spans = np.zeros(n + 1, dtype=np.int64)
     np.add.at(spans, lo, 1)
@@ -762,10 +735,8 @@ def draw_from_buckets(lo: Indices, count: Indices, remap: Indices,
 class BrightnessMetric:
     """Match each cell to a gallery image of near-identical average brightness.
 
-    A cell's brightness rounds to one of 256 levels, so precompute resolves
-    every possible match once: each level gets a bucket of the `candidates`
-    nearest images (none further than `epsilon`) and match() samples one.
-    See docs/brightness-matching.md.
+    Each of the 256 levels a cell can round to gets a bucket of the `candidates`
+    nearest images, none past `epsilon`. See docs/brightness-matching.md.
     """
 
     def __init__(self, candidates: int = 1, epsilon: float = 0.0, seed: int = 0):
@@ -825,7 +796,6 @@ class BrightnessMetric:
                                  keys, self._rng)
 
     def match(self, frame: Image) -> Indices:
-        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
         return self.sample(self.keys(frame))
 
     @property
@@ -836,16 +806,14 @@ class BrightnessMetric:
 
     @property
     def tiles(self) -> Image:
-        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
         return self._tiles
 
 
 def nearest_occupied(occupied: npt.NDArray[np.bool_], bins: int) -> Indices:
     """For every cell of a bins^3 lattice, the index of the nearest occupied one.
 
-    A BFS wave over the six face neighbours, so "nearest" is Manhattan. Exact
-    Euclidean wants a KD-tree, which is a whole dependency for a tie-break
-    nobody can see in the output.
+    A BFS wave over the six face neighbours, so "nearest" is Manhattan rather
+    than Euclidean. See docs/colour-matching.md.
     """
     if not occupied.any():
         raise ValueError("gallery has no tiles to match against")
@@ -872,10 +840,8 @@ def nearest_occupied(occupied: npt.NDArray[np.bool_], bins: int) -> Indices:
 class ColourMetric:
     """Match each cell to a gallery image of near-identical average colour.
 
-    Mean BGR quantised onto a `bins`^3 lattice. Every lattice cell holds the
-    tiles that landed in it, so a match is one lookup per grid cell — the same
-    O(1) as brightness, over three channels instead of one. Empty lattice cells
-    borrow the nearest occupied one. See docs/colour-matching.md.
+    Mean BGR quantised onto a `bins`^3 lattice, where an empty lattice cell
+    borrows the nearest occupied one. See docs/colour-matching.md.
     """
 
     def __init__(self, bins: int = 32, candidates: int = 1, seed: int = 0):
@@ -889,8 +855,6 @@ class ColourMetric:
 
     def precompute(self, gallery: Image, cell_size: tuple[int, int],
                    brightness: Brightness | None = None) -> None:
-        # brightness is the caller's leftover from shrink_gallery(); colour
-        # matching has no use for it.
         check_cell_size(gallery, cell_size)
         bins = self._bins
         keys = self._quantise(gallery.mean(axis=(1, 2)))
@@ -925,7 +889,6 @@ class ColourMetric:
                                  keys, self._rng)
 
     def match(self, frame: Image) -> Indices:
-        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
         return self.sample(self.keys(frame))
 
     @property
@@ -940,17 +903,14 @@ class ColourMetric:
 
     @property
     def tiles(self) -> Image:
-        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
         return self._tiles
 
 
 class SteadyMetric:
     """Hold a cell's tile for as long as its bucket key doesn't change.
 
-    Without this every cell re-rolls its bucket every frame, so a region that
-    isn't moving still shimmers — 11.4% of tile indices change per frame on Bad
-    Apple where only 10.2% of cells change colour, and the gap widens with
-    `candidates`. See docs/colour-matching.md.
+    Without it every cell re-rolls its bucket every frame, so regions that
+    aren't moving still shimmer. See docs/colour-matching.md.
     """
 
     def __init__(self, inner: Metric):
@@ -976,7 +936,6 @@ class SteadyMetric:
         return picks
 
     def match(self, frame: Image) -> Indices:
-        """(H, W, 3) frame -> (grid_y, grid_x) array of tile indices."""
         return self.sample(self.keys(frame))
 
     @property
@@ -985,7 +944,6 @@ class SteadyMetric:
 
     @property
     def tiles(self) -> Image:
-        """(U, cell_h, cell_w, 3) pre-resized tiles, indexed by match()."""
         return self._inner.tiles
 
 
@@ -1063,7 +1021,6 @@ def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-y", str(output_path)
     ], stdin=subprocess.PIPE)
-    # Only ever None when stdin=PIPE wasn't asked for, which it was.
     assert proc.stdin is not None
 
     try:
@@ -1086,12 +1043,8 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
                    total_frames: int = 0) -> Path:
     """Stack the source and its mosaic side by side into one video.
 
-    `hstack` wants both inputs at the same height, and target dimensions are
-    snapped to a grid multiple, so the source gets scaled rather than trusted
-    to match.
-
-    `-progress pipe:1` makes ffmpeg emit `key=value` lines on stdout as it goes;
-    the `frame=` ones drive the bar.
+    The source is scaled to the mosaic's size: `hstack` needs equal heights, and
+    the two only match by coincidence. See docs/streaming-and-encoding.md.
     """
     width, height = dimensions
     proc = subprocess.Popen([
@@ -1106,15 +1059,14 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
         "-pix_fmt", "yuv420p",
         "-y", str(output_path)
     ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
-    # Only ever None when stdout=PIPE wasn't asked for, which it was.
     assert proc.stdout is not None
 
     with tqdm.tqdm(desc="Combining videos...", total=total_frames or None,
                    unit="frame") as bar:
+        # -progress prints key=value lines, and frame= is a running total.
         for line in proc.stdout:
             key, _, value = line.partition("=")
             if key == "frame":
-                # It's a running total, not a delta.
                 bar.update(int(value) - bar.n)
     proc.wait()
 
@@ -1153,9 +1105,8 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
 
 
 if __name__ == "__main__":
-    # Swap for VideoGallery(Path("./assets/videos"), stride=10) to build the
-    # tiles out of your own videos instead. CIFAR is what docs/ tells you to
-    # download, so it's what a clean checkout can actually run.
+    # Swap in VideoGallery(Path("./assets/videos"), stride=10) for your own
+    # videos. CIFAR stays the default because the README has you download it.
     main(CifarGallery(Path("./assets/gallery/train")),
          UserConfig(input_dir="./assets/source.mp4",
                     output_dir="./output/",

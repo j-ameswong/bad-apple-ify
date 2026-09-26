@@ -65,3 +65,19 @@ non-square cell will shift dimensions slightly under the new default.
 At `grid_size=1` the cell is the whole source frame, so it has the source's
 ratio and there's nothing to reshape — `native` can't apply. The tile is fitted
 into that cell by cropping, which is the better of the two things left.
+
+## Resampling
+
+Once the image is cropped (or not), `fit_to_cell()` resizes it, and the
+interpolation depends on which way it's going.
+
+Shrinking uses `INTER_AREA`. Bilinear reads a 2x2 neighbourhood per output
+pixel, so 1080p into a 14x8 tile samples the frame rather than averaging it,
+and the tile's brightness lands nowhere near the frame's.
+
+Growing uses bilinear, because `INTER_AREA` degenerates to nearest-neighbour on
+the way up. Single-frame mode is the case that grows: it blows a 32x32 CIFAR
+image up to the whole frame.
+
+The switch changed the pixels an unchanged source produces, which is what
+`TILE_VERSION` 2 in the [tile cache](gallery-cache.md) is for.

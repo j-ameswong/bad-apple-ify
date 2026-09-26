@@ -49,6 +49,11 @@ rest of the run, and dedupe can leave a lot of it empty.
 high, so the estimate stays an upper bound, which is what the
 [budget check](gallery-size.md) needs it to be.
 
+`estimate_count()` is memoised. A load asks for it three times (the budget
+check, the buffer's first allocation, the progress bar's total), and every ask
+opens each file in the directory. A directory that changes mid-run gets a stale
+count, which costs a resize at worst.
+
 ## Dedupe
 
 Tiles are hashed after downscale (blake2b, 8 bytes) and duplicates dropped. This
