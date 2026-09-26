@@ -4,12 +4,15 @@ A gallery load is one decode pass over the whole source — minutes for a video
 gallery — so the tests here are mostly about *not* calling `load()`.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from conftest import CELL
+import main
 from main import (CifarGallery, DerivedConfig, HARD_BUDGET, cache_key,
-                  load_gallery)
+                  load_gallery, read_cached_tiles)
 
 
 class CountingSource:
@@ -160,6 +163,86 @@ def test_wrong_dtype_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
 
     assert source.loads == 2
     assert tiles.dtype == np.uint8
+
+
+def flip(data: bytes, index: int, bit: int) -> bytes:
+    mangled = bytearray(data)
+    mangled[index] ^= 1 << bit
+    return bytes(mangled)
+
+
+# In order, these get ValueError, TokenError, TypeError and SyntaxError out of
+# numpy's header parser. See docs/gallery-cache.md.
+MANGLED_HEADERS = {
+    "empty file": lambda data: b"",
+    # Byte 8 is the low byte of the header length, so the dict stops mid-shape.
+    "length cut short": lambda data: flip(data, 8, 6),
+    "bytes key": lambda data: data.replace(b"'shape'", b"b'shape'"),
+    "comma in the dtype": lambda data: data.replace(b"'|u1'", b"',u1'"),
+}
+
+
+@pytest.mark.parametrize("mangling", MANGLED_HEADERS)
+def test_a_mangled_header_falls_back_to_a_reload(cache_dir, cell_gallery, mangling):
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    cached_file.write_bytes(MANGLED_HEADERS[mangling](cached_file.read_bytes()))
+
+    tiles = load_gallery(source, derived, cache_dir=cache_dir)
+
+    assert source.loads == 2
+    assert tiles.shape == (len(cell_gallery), CELL[1], CELL[0], 3)
+
+
+def test_any_one_bit_flipped_in_the_header_is_a_miss_or_the_same_tiles(
+        tmp_path, cell_gallery):
+    """Never an exception and never the wrong tiles. Over a quarter of these
+    flips get TokenError out of numpy rather than ValueError."""
+    path = tmp_path / "tiles.npy"
+    np.save(path, cell_gallery)
+    data = path.read_bytes()
+
+    for index in range(data.index(b"\n") + 1):
+        for bit in range(8):
+            path.write_bytes(flip(data, index, bit))
+            tiles = read_cached_tiles(path, CELL)
+            assert tiles is None or np.array_equal(tiles, cell_gallery), (index, bit)
+
+
+def test_a_fortran_order_cache_never_comes_back_scrambled(cache_dir, cell_gallery):
+    """Right shape, right dtype, bytes in the other order. Read as C order
+    they'd be scrambled tiles, so it has to be a miss."""
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    first = load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    np.save(cached_file, np.asfortranarray(first))
+
+    np.testing.assert_array_equal(
+        load_gallery(source, derived, cache_dir=cache_dir), first)
+
+
+def test_a_cache_cut_short_after_its_size_check_falls_back_to_a_reload(
+        cache_dir, cell_gallery, monkeypatch):
+    """The stat and the read are separate calls, and anything truncating the
+    file in place between them (`cp` over it, say) leaves the read short."""
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    whole = cached_file.stat().st_size
+    cached_file.write_bytes(cached_file.read_bytes()[:-100])
+    monkeypatch.setattr(main.os, "fstat", lambda fd: SimpleNamespace(st_size=whole))
+
+    tiles = load_gallery(source, derived, cache_dir=cache_dir)
+
+    assert source.loads == 2
+    assert tiles.shape == (len(cell_gallery), CELL[1], CELL[0], 3)
 
 
 def test_no_temp_files_are_left_behind(cache_dir, cell_gallery):

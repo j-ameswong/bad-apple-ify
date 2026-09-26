@@ -305,13 +305,31 @@ def test_a_cache_hit_over_budget_is_refused_before_it_loads(tmp_path, monkeypatc
     load_gallery(TinySource(4, fingerprint="cached:1"), derived_for(CELL),
                  cache_dir=cache_dir)
 
-    def no_load(*args, **kwargs):
-        raise AssertionError("np.load ran before the budget check")
-    monkeypatch.setattr(np, "load", no_load)
+    def no_alloc(*args, **kwargs):
+        raise AssertionError("tiles were allocated before the budget check")
+    monkeypatch.setattr(np, "empty", no_alloc)
 
     with pytest.raises(GalleryTooLarge, match="4 tiles"):
         load_gallery(ExplodingSource(4, fingerprint="cached:1"),
                      derived_for(CELL), cache_dir=cache_dir, budget=8)
+
+
+def test_a_mangled_count_is_a_miss_not_a_refusal(tmp_path):
+    """The count is priced only once the file size backs it up. Otherwise one
+    flipped bit turning 4 tiles into 6 reads as a gallery over budget."""
+    cache_dir = tmp_path / "cache"
+    source = TinySource(4, fingerprint="cached:1")
+    load_gallery(source, derived_for(CELL), cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    data = cached_file.read_bytes()
+    cached_file.write_bytes(data.replace(b"(4, 4, 4, 3)", b"(6, 4, 4, 3)"))
+
+    # 4 tiles are 192 B and fit; 6 would be 288 B and wouldn't.
+    tiles = load_gallery(source, derived_for(CELL), cache_dir=cache_dir,
+                         budget=200)
+
+    assert tiles.shape == (4, CELL[1], CELL[0], 3)
 
 
 def test_format_bytes_reads_like_a_person_wrote_it():

@@ -6,6 +6,7 @@ import tqdm
 import hashlib
 import os
 import pickle
+import tokenize
 import warnings
 from fractions import Fraction
 from pathlib import Path
@@ -528,32 +529,42 @@ def check_gallery_budget(source: GallerySource, cell_size: tuple[int, int],
         print(f"Gallery estimate: {arithmetic}")
 
 
-def cached_tile_count(path: Path, cell_size: tuple[int, int]) -> int | None:
-    """Tile count from a cached `.npy`'s header, or None if it isn't our tiles.
+def read_cached_tiles(path: Path, cell_size: tuple[int, int],
+                      budget: int = HARD_BUDGET) -> Image | None:
+    """The tiles cached at `path`, or None if the file is malformed.
 
-    Reads the header and stats the file, nothing more, so a cache that's grown
-    past the budget gets refused before a byte of it lands in RAM.
+    One handle throughout, and the count is priced only once the file size
+    backs it up. See docs/gallery-cache.md.
     """
     readers = {(1, 0): np.lib.format.read_array_header_1_0,
                (2, 0): np.lib.format.read_array_header_2_0}
     cell_w, cell_h = cell_size
-    try:
-        with open(path, "rb") as f:
+    with open(path, "rb") as f:
+        try:
             reader = readers.get(np.lib.format.read_magic(f))
             if reader is None:
                 return None
-            shape, _, dtype = reader(f)
-            data_start = f.tell()
-    except ValueError:  # bad magic, bad header, or cut off inside one
-        return None
+            shape, fortran_order, dtype = reader(f)
+        except (ValueError, SyntaxError, TypeError, tokenize.TokenError):
+            # numpy's parser throws all four on a mangled header, not just ValueError.
+            return None
 
-    if dtype != np.uint8 or len(shape) != 4 or shape[1:] != (cell_h, cell_w, 3):
-        return None
-    # A truncated file has an honest header and too few bytes behind it.
-    count = shape[0]
-    if path.stat().st_size != data_start + count * cell_h * cell_w * 3:
-        return None
-    return count
+        if (dtype != np.uint8 or fortran_order or len(shape) != 4
+                or shape[1:] != (cell_h, cell_w, 3)):
+            return None
+        # A truncated file has an honest header and too few bytes behind it.
+        count = shape[0]
+        if os.fstat(f.fileno()).st_size != f.tell() + count * cell_h * cell_w * 3:
+            return None
+
+        # A cache written under a bigger budget is refused, not re-decoded:
+        # the decode would come to the same count.
+        enforce_gallery_budget(count, cell_size, budget)
+        tiles: Image = np.empty(shape, dtype=np.uint8)
+        # Short only if something truncated the file since the size check.
+        if f.readinto(tiles) != tiles.nbytes:
+            return None
+    return tiles
 
 
 def load_gallery(source: GallerySource, derived: DerivedConfig, *,
@@ -569,15 +580,12 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
     cell_size = derived.cell_size
     path = cache_dir / f"tiles-{cache_key(source, cell_size, fit)}.npy"
     if use_cache and path.exists():
-        count = cached_tile_count(path, cell_size)
+        cached = read_cached_tiles(path, cell_size, budget)
         # A truncated or hand-edited file isn't worth trusting over a re-decode.
-        if count is not None:
-            # A cache written under a bigger budget is refused, not re-decoded:
-            # the decode would come to the same count.
-            size = enforce_gallery_budget(count, cell_size, budget)
-            tiles: Image = np.load(path)
-            print(f"Gallery cache hit: {path} ({count} tiles, {format_bytes(size)})")
-            return tiles
+        if cached is not None:
+            print(f"Gallery cache hit: {path} ({len(cached)} tiles, "
+                  f"{format_bytes(cached.nbytes)})")
+            return cached
         print(f"Gallery cache at {path} is malformed, reloading")
 
     # A hit prices the real count above; only a decode needs the estimate.
