@@ -108,9 +108,11 @@ class DerivedConfig:
 
         # yuv420p won't take an odd side. Rows first, then the width they imply.
         rows, cell_h = even_span(grid[1], cell_size[1], dimensions[1])
-        height = rows * cell_h
-        cols, cell_w = even_span(grid[0], cell_size[0],
-                                 height * dimensions[0] / dimensions[1])
+        ideal_w = rows * cell_h * dimensions[0] / dimensions[1]
+        # A row step moves the height a whole cell, so recount the columns too.
+        cols = (grid[0] if rows == grid[1]
+                else max(round(ideal_w / cell_size[0]), 1))
+        cols, cell_w = even_span(cols, cell_size[0], ideal_w)
         grid, cell_size = (cols, rows), (cell_w, cell_h)
 
         return cls(src_fps=fps, src_dimensions=dimensions,

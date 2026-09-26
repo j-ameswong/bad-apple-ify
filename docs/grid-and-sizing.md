@@ -58,10 +58,17 @@ columns of 27px, 1917 wide, and 720p at `grid_size=3` was 27 rows of 27px.
 `even_span()` fixes a side by moving the count one step, never the cell, so a
 native tile keeps its shape. It takes whichever step lands nearer the ideal:
 1944 over 1890 for that 1080p case, since 1920 is 24 away from one and 30 from
-the other. Rows go first against the source height, then the columns against
-the width the new height implies, so a row that moves drags the width with it.
-Single-frame mode is the exception. Its 1x1 grid can't move, so the one cell
-gives up a pixel instead (853x480 becomes 852x480).
+the other. Single-frame mode is the exception. Its 1x1 grid can't move, so the
+one cell gives up a pixel instead (853x480 becomes 852x480).
+
+Rows go first, against the source height. A row step moves the height a whole
+cell, so the columns are then recounted against the width the new height
+implies, and only after that made even. Checking their parity alone isn't
+enough: that 720p case drops to 26 rows, 702 high, and its 48 columns were
+already even at 1296, 3.85% too wide for 16:9. Recounted, it's 46 columns and
+1242, 0.5% off. The row count is the aspect pair's height times `grid_size`, so
+it's only ever odd at an odd `grid_size`, which is why 8 and 16 never showed
+this.
 
 A step is a whole cell, so on a coarse grid the fix costs shape. At 3 columns a
 step is a third of the frame. At the grid sizes worth running it's a few

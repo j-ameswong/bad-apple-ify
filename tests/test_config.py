@@ -147,11 +147,23 @@ def test_1080p_native_widescreen_tiles_come_out_even():
 
 
 def test_an_odd_row_count_gives_way_on_the_height():
-    """720p at grid_size=3 was 27 rows of 27px, 729 high."""
+    """720p at grid_size=3 was 27 rows of 27px, 729 high. One row fewer is 702,
+    and the columns have to follow: all 48 were already even, 1296 wide and
+    3.85% too wide for 16:9. Recounted, 46 is 1242 and 0.5% off."""
     derived = derive(1280, 720, grid_size=3)
 
     assert derived.cell_size == (27, 27)
-    assert derived.target_dimensions == (1296, 702)
+    assert derived.target_dimensions == (1242, 702)
+
+
+def test_a_row_step_recounts_native_columns():
+    """1080p at grid_size=7 against 16:9 tiles steps up to 64 rows, 1088 high.
+    The 63 columns counted against the old height stayed 1890 wide, 2.3%
+    narrow; 64 of them is 1920."""
+    derived = derive(1920, 1080, grid_size=7, tile_aspect=(16, 9))
+
+    assert derived.cell_size == (30, 17)
+    assert derived.target_dimensions == (1920, 1088)
 
 
 def test_single_frame_mode_trims_the_cell_instead():
