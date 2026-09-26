@@ -27,11 +27,16 @@ tiles.
 
 ## Reads and writes
 
-A cache hit skips the [size estimate](gallery-size.md) — the file on disk is the
-real answer, so there's nothing left to guess about.
+A cache hit skips the [size estimate](gallery-size.md), since the file on disk
+is the real answer. It doesn't skip the budget. `cached_tile_count()` reads the
+`.npy` header and stats the file, and the count it gets back is priced exactly
+like an estimate before `np.load` touches the data. A cache written under a
+bigger `gallery_budget` raises `GalleryTooLarge` rather than re-decoding, because
+the decode would land on the same count.
 
-A cache hit still checks the array's shape against the expected cell size. A
-truncated or hand-edited file isn't worth trusting over a re-decode, and the key
+The same header read vets the file: uint8, `(N, cell_h, cell_w, 3)`, and exactly
+as many bytes behind the header as that shape needs. Anything else (a truncated
+write, a hand-edited array, the wrong dtype) falls back to a re-decode. The key
 already guarantees the tiles are otherwise current.
 
 Writes go to a temp file named with the pid and then `replace()` onto the real

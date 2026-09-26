@@ -83,5 +83,7 @@ where trying anyway costs more than stopping. An OOM twelve minutes into a
 decode destroys more work than a message does, and the override is one config
 field away for anyone who really does have the RAM.
 
-A cache hit skips the estimate entirely. The `.npy` on disk is the true answer,
-and it already fit once.
+A cache hit skips the estimate, since the `.npy` on disk is the true answer. It
+still gets priced: the tile count comes out of the file's header and goes
+through the same check before the array is read, so a cache built under a
+bigger budget can't sneak past a smaller one.

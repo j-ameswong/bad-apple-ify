@@ -132,6 +132,36 @@ def test_malformed_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
     assert tiles.shape[1:] == (CELL[1], CELL[0], 3)
 
 
+def test_truncated_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
+    """Right header, missing tail — the header alone would call it a hit."""
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    data = cached_file.read_bytes()
+    cached_file.write_bytes(data[:-100])
+
+    tiles = load_gallery(source, derived, cache_dir=cache_dir)
+
+    assert source.loads == 2
+    assert tiles.shape == (len(cell_gallery), CELL[1], CELL[0], 3)
+
+
+def test_wrong_dtype_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    np.save(cached_file, np.zeros((3, CELL[1], CELL[0], 3), dtype=np.float32))
+
+    tiles = load_gallery(source, derived, cache_dir=cache_dir)
+
+    assert source.loads == 2
+    assert tiles.dtype == np.uint8
+
+
 def test_no_temp_files_are_left_behind(cache_dir, cell_gallery):
     load_gallery(CountingSource(cell_gallery), derived_for(CELL), cache_dir=cache_dir)
 

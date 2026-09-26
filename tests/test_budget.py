@@ -299,6 +299,21 @@ def test_a_cache_hit_skips_the_estimate_entirely(tmp_path, cell_gallery):
     assert tiles.shape == (4, CELL[1], CELL[0], 3)
 
 
+def test_a_cache_hit_over_budget_is_refused_before_it_loads(tmp_path, monkeypatch):
+    """A cache written under a bigger budget still has to fit this one's."""
+    cache_dir = tmp_path / "cache"
+    load_gallery(TinySource(4, fingerprint="cached:1"), derived_for(CELL),
+                 cache_dir=cache_dir)
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("np.load ran before the budget check")
+    monkeypatch.setattr(np, "load", no_load)
+
+    with pytest.raises(GalleryTooLarge, match="4 tiles"):
+        load_gallery(ExplodingSource(4, fingerprint="cached:1"),
+                     derived_for(CELL), cache_dir=cache_dir, budget=8)
+
+
 def test_format_bytes_reads_like_a_person_wrote_it():
     assert format_bytes(512) == "512 B"
     assert format_bytes(38 * 1024 ** 2) == "38 MB"
