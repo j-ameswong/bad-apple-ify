@@ -100,7 +100,7 @@ def test_cifar_load_checks_decoded_count_before_resizing(cifar_pickle, monkeypat
     def unexpected_resize(*args, **kwargs):
         raise AssertionError("oversized CIFAR rows reached the resize")
 
-    monkeypatch.setattr("main.resize_gallery_to_cells", unexpected_resize)
+    monkeypatch.setattr("bad_apple.gallery.resize_gallery_to_cells", unexpected_resize)
     with pytest.raises(GalleryTooLarge):
         UnderestimatingCifar(path).load(CELL, budget=100)
 

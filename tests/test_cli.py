@@ -118,8 +118,8 @@ def test_dry_run_only_probes_and_estimates(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.chdir(tmp_path)
     derived = SimpleNamespace(cell_size=(16, 16))
     seen: list[str] = []
-    monkeypatch.setattr(cli.pipeline, "probe_video", lambda config, tile_aspect=None: (seen.append("probe") or derived))
-    monkeypatch.setattr(cli.pipeline, "check_gallery_budget", lambda *args: seen.append("estimate"))
+    monkeypatch.setattr(cli.video, "probe_video", lambda config, tile_aspect=None: (seen.append("probe") or derived))
+    monkeypatch.setattr(cli.gallery, "check_gallery_budget", lambda *args: seen.append("estimate"))
     monkeypatch.setattr(cli.pipeline, "main", lambda *args: pytest.fail("full pipeline called"))
     assert cli.cli_main(["--source", "s.mp4", "--gallery", "g.pkl", "--dry-run"]) == 0
     assert seen == ["probe", "estimate"]
@@ -139,7 +139,7 @@ def test_dry_run_rejects_missing_or_unreadable_video_gallery(
     elif gallery_kind == "broken":
         gallery_path.write_bytes(b"not a video")
     monkeypatch.setattr(
-        cli.pipeline, "probe_video",
+        cli.video, "probe_video",
         lambda config, tile_aspect=None: SimpleNamespace(cell_size=(16, 16)),
     )
 

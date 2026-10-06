@@ -8,7 +8,7 @@ import subprocess
 import numpy as np
 import pytest
 
-import main as pipeline
+import bad_apple.video as video_io
 from conftest import probe_stream, read_video
 from main import (CifarGallery, DerivedConfig, UserConfig, build_metric,
                   build_mosaics, encode_video, main, parse_config, probe_video,
@@ -93,7 +93,7 @@ def test_stream_stops_reading_and_releases_capture(video, monkeypatch):
     config = UserConfig(input_dir=str(path), output_dir="", grid_size=2,
                         start=0.1, duration=0.1)
     derived = probe_video(config)
-    real_capture = pipeline.cv2.VideoCapture
+    real_capture = video_io.cv2.VideoCapture
     calls = []
 
     class Capture:
@@ -115,7 +115,7 @@ def test_stream_stops_reading_and_releases_capture(video, monkeypatch):
             calls.append("release")
             self.cap.release()
 
-    monkeypatch.setattr(pipeline.cv2, "VideoCapture", Capture)
+    monkeypatch.setattr(video_io.cv2, "VideoCapture", Capture)
     assert len(list(stream_frames(config, derived))) == 3
     assert calls == ["grab"] * 3 + ["read"] * 3 + ["release"]
 
@@ -148,7 +148,7 @@ def test_sixty_second_start_produces_the_full_runs_next_300_frames(
                 yield mosaic
         return encode_video(record(), derived, output_path)
 
-    monkeypatch.setattr(pipeline, "encode_video", record_encode)
+    monkeypatch.setattr(video_io, "encode_video", record_encode)
     combined = main(gallery, config)
 
     np.testing.assert_array_equal(captured, expected)
@@ -187,7 +187,7 @@ def test_empty_slice_does_not_launch_an_encoder(tmp_path, video, monkeypatch):
     def unexpected_encoder(*args, **kwargs):
         pytest.fail("ffmpeg must not run for an empty slice")
 
-    monkeypatch.setattr(pipeline.subprocess, "Popen", unexpected_encoder)
+    monkeypatch.setattr(video_io.subprocess, "Popen", unexpected_encoder)
     with pytest.raises(ValueError, match="contains no frames"):
         encode_video(stream_frames(config, derived), derived, tmp_path / "out.mp4")
     assert not (tmp_path / "out.mp4").exists()

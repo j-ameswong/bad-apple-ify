@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from conftest import write_rated_video
-import main
+import bad_apple.video as video_io
 from main import UserConfig, probe_video, stream_frames
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None,
@@ -59,7 +59,7 @@ def test_stream_frames_reads_only_as_far_as_asked(video, monkeypatch):
     config = UserConfig(input_dir=str(path), output_dir="", grid_size=2)
     derived = probe_video(config)
     reads = []
-    real_capture = main.cv2.VideoCapture
+    real_capture = video_io.cv2.VideoCapture
 
     class CountingCapture:
         def __init__(self, name):
@@ -72,7 +72,7 @@ def test_stream_frames_reads_only_as_far_as_asked(video, monkeypatch):
             reads.append(True)
             return self._cap.read()
 
-    monkeypatch.setattr(main.cv2, "VideoCapture", CountingCapture)
+    monkeypatch.setattr(video_io.cv2, "VideoCapture", CountingCapture)
     stream = stream_frames(config, derived)
 
     assert reads == []
@@ -89,9 +89,9 @@ def test_stream_frames_survives_bad_frame_count(video, monkeypatch):
     config = UserConfig(input_dir=str(path), output_dir="", grid_size=2)
     derived = probe_video(config)
 
-    real_get = cv2.VideoCapture.get
+    real_get = video_io.cv2.VideoCapture.get
     monkeypatch.setattr(
-        cv2.VideoCapture, "get",
+        video_io.cv2.VideoCapture, "get",
         lambda self, prop: 9999.0 if prop == cv2.CAP_PROP_FRAME_COUNT else real_get(self, prop),
     )
 
@@ -127,7 +127,7 @@ def test_probe_video_releases_capture_when_metadata_is_invalid(video, monkeypatc
             released.append(True)
             self._capture.release()
 
-    monkeypatch.setattr(main.cv2, "VideoCapture", InvalidRateCapture)
+    monkeypatch.setattr(video_io.cv2, "VideoCapture", InvalidRateCapture)
     with pytest.raises(ValueError, match="invalid frame rate"):
         probe_video(UserConfig(input_dir=str(path), output_dir=""))
     assert released == [True]

@@ -19,13 +19,12 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# main.py lives at the repo root, not in a package.
+# Import the local package and compatibility scripts from a source checkout.
 pythonpath = ["."]
 
 [tool.mypy]
-# `uv run mypy` with no arguments checks the pipeline. The tests aren't in
-# scope — they'd be 97 mechanical `-> None`s for nothing.
-files = ["main.py", "cli.py", "segments.py"]
+# `uv run mypy` checks the package and its compatibility entrypoints.
+files = ["bad_apple", "main.py", "cli.py", "segments.py"]
 strict = true
 
 [tool.pyright]

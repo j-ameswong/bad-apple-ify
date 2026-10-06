@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import main
-import segments
+import bad_apple.segments as segments
+import bad_apple.gallery as gallery_io
 from conftest import read_video
 from main import UserConfig, build_metric, probe_video
 
@@ -26,7 +26,7 @@ def setup_run(tmp_path: Path, video_factory, gallery, count: int = 6,
                         grid_size=2, candidates=8, colour_bins=8, seed=17,
                         segment_frames=segment_frames)
     derived = probe_video(config)
-    tiles = main.resize_gallery_to_cells(gallery, derived.cell_size)
+    tiles = gallery_io.resize_gallery_to_cells(gallery, derived.cell_size)
     metric = build_metric(tiles, config, derived)
     return source_path, output, config, derived, metric
 
@@ -53,7 +53,7 @@ def test_interrupted_resume_restores_metric_and_seeks_after_checkpoint(
 
     resumed_config = replace(config, output_dir=str(tmp_path / "resumed"))
     resumed_derived = probe_video(resumed_config)
-    resumed_metric = build_metric(main.resize_gallery_to_cells(
+    resumed_metric = build_metric(gallery_io.resize_gallery_to_cells(
         gallery, resumed_derived.cell_size), resumed_config, resumed_derived)
     resumed_output = interrupted_output
     resumed_starts: list[int] = []
@@ -79,7 +79,7 @@ def test_interrupted_resume_restores_metric_and_seeks_after_checkpoint(
     full_root.mkdir()
     full_config = replace(config, output_dir=str(full_root))
     full_derived = probe_video(full_config)
-    full_metric = build_metric(main.resize_gallery_to_cells(gallery,
+    full_metric = build_metric(gallery_io.resize_gallery_to_cells(gallery,
                                                             full_derived.cell_size),
                                full_config, full_derived)
     full_output = full_root / "mosaic.mp4"
@@ -107,14 +107,14 @@ def test_changed_configuration_and_source_are_refused(tmp_path, video_factory,
 
     changed_config = replace(config, seed=config.seed + 1)
     changed_derived = probe_video(changed_config)
-    changed_metric = build_metric(main.resize_gallery_to_cells(
+    changed_metric = build_metric(gallery_io.resize_gallery_to_cells(
         gallery, changed_derived.cell_size), changed_config, changed_derived)
     with pytest.raises(ValueError, match="different source or configuration"):
         segments.encode_segmented(FakeGallery(), changed_config, changed_derived,
                                  changed_metric, output)
 
     changed_gallery = FakeGallery("different-gallery")
-    same_metric = build_metric(main.resize_gallery_to_cells(gallery,
+    same_metric = build_metric(gallery_io.resize_gallery_to_cells(gallery,
                                                             derived.cell_size),
                                config, derived)
     with pytest.raises(ValueError, match="different source or configuration"):
@@ -125,7 +125,7 @@ def test_changed_configuration_and_source_are_refused(tmp_path, video_factory,
     stat = source_path.stat()
     import os
     os.utime(source_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
-    touched_metric = build_metric(main.resize_gallery_to_cells(gallery,
+    touched_metric = build_metric(gallery_io.resize_gallery_to_cells(gallery,
                                                                derived.cell_size),
                                   config, derived)
     with pytest.raises(ValueError, match="different source or configuration"):
@@ -138,7 +138,7 @@ def test_corrupt_segment_is_rejected(tmp_path, video_factory, gallery):
     segments.encode_segmented(FakeGallery(), config, derived, metric, output)
     part = output.parent / "segments" / "part_0000.mp4"
     part.write_bytes(part.read_bytes() + b"corruption")
-    new_metric = build_metric(main.resize_gallery_to_cells(gallery,
+    new_metric = build_metric(gallery_io.resize_gallery_to_cells(gallery,
                                                            derived.cell_size),
                               config, derived)
     with pytest.raises(ValueError, match="missing or corrupt"):
@@ -157,7 +157,7 @@ def test_manifest_rejects_boolean_frame_count(tmp_path, video_factory, gallery):
     manifest["segments"][0]["frames"] = True
     manifest_path.write_text(json.dumps(manifest))
 
-    new_metric = build_metric(main.resize_gallery_to_cells(
+    new_metric = build_metric(gallery_io.resize_gallery_to_cells(
         gallery, derived.cell_size), config, derived)
     with pytest.raises(ValueError, match="invalid frame count"):
         segments.encode_segmented(FakeGallery(), config, derived, new_metric,

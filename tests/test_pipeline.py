@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 
-import main as app
+import bad_apple.video as video_io
 
 from conftest import (CELL, make_frames, probe_stream, read_video,
                       write_rated_video, write_video)
@@ -188,7 +188,7 @@ def test_encode_video_reaps_ffmpeg_after_broken_pipe_on_close(
             return self.returncode
 
     process = Process()
-    monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(video_io.subprocess, "Popen", lambda *args, **kwargs: process)
     output = tmp_path / "mosaic.mp4"
     output.write_bytes(b"old complete output")
     frame = np.zeros((*derived.target_dimensions[::-1], 3), dtype=np.uint8)

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from conftest import CELL, make_frames, write_video
-import main
+import bad_apple.gallery as gallery_io
 from main import (CifarGallery, DerivedConfig, GalleryTooLarge, HARD_BUDGET,
                   TileBuffer, VideoGallery, check_gallery_budget, format_bytes,
                   load_gallery)
@@ -129,7 +129,7 @@ def test_a_refused_load_still_releases_the_capture(tmp_path, monkeypatch):
     path = tmp_path / "gallery.mkv"
     write_video(path, make_frames(20, 16, 16))
     released = []
-    real_capture = main.cv2.VideoCapture
+    real_capture = gallery_io.cv2.VideoCapture
 
     class TrackingCapture:
         def __init__(self, name):
@@ -142,7 +142,7 @@ def test_a_refused_load_still_releases_the_capture(tmp_path, monkeypatch):
             released.append(True)
             self._cap.release()
 
-    monkeypatch.setattr(main.cv2, "VideoCapture", TrackingCapture)
+    monkeypatch.setattr(gallery_io.cv2, "VideoCapture", TrackingCapture)
     source = VideoGallery(path, stride=1)
     monkeypatch.setattr(source, "estimate_count", lambda: 1)
 

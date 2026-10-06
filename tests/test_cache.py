@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from conftest import CELL
-import main
+import bad_apple.gallery as gallery_io
 from main import (CifarGallery, DerivedConfig, HARD_BUDGET, cache_key,
                   load_gallery, read_cached_tiles)
 
@@ -254,7 +254,7 @@ def test_a_cache_cut_short_after_its_size_check_falls_back_to_a_reload(
     cached_file, = cache_dir.glob("*.npy")
     whole = cached_file.stat().st_size
     cached_file.write_bytes(cached_file.read_bytes()[:-100])
-    monkeypatch.setattr(main.os, "fstat", lambda fd: SimpleNamespace(st_size=whole))
+    monkeypatch.setattr(gallery_io.os, "fstat", lambda fd: SimpleNamespace(st_size=whole))
 
     tiles = load_gallery(source, derived, cache_dir=cache_dir)
 
