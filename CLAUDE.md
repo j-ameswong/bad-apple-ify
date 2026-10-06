@@ -1,117 +1,84 @@
-# CLAUDE.md
+# Repository guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Purpose
 
-## What this project does
+This project turns a source video into a photo mosaic using images from a
+CIFAR-100 pickle or a video gallery. It writes the mosaic video and a second,
+side-by-side video with the source audio. Frames are processed as a stream;
+the resized gallery and metric lookup tables stay in memory.
 
-Takes any video and reconstructs each frame as a photo mosaic where every tile is a real image from a gallery (CIFAR-100) matched by brightness. Produces a side-by-side video of the original and mosaic version via ffmpeg.
+## Common commands
 
-## Running
-
-```bash
-uv sync          # install dependencies
-uv run main.py   # run the pipeline
-```
-
-Requires `ffmpeg` on PATH. The gallery is whatever `GallerySource` `__main__`
-passes: `VideoGallery(Path("./assets/videos"))` for a directory of videos, or
-`CifarGallery(Path("./assets/gallery/train"))` for the CIFAR-100 pickle.
-
-## Testing
-
-```bash
+```sh
+uv sync
+uv run cli.py --source assets/source.mp4 --gallery assets/gallery/train
 uv run pytest
-```
-
-Runs on a clean checkout with no assets present — fixtures in `tests/conftest.py`
-generate a synthetic FFV1/mkv video (lossless, so tests can assert on exact
-pixels) and a 100-image fake gallery, plus a CIFAR-format pickle built from it.
-Neither `assets/source.mp4` nor the 155 MB CIFAR pickle is needed.
-
-## Type checking
-
-```bash
 uv run mypy
 ```
 
-Config is in `pyproject.toml`: `strict = true` over `main.py` only, so the bare
-command is the check. Arrays go through the `Image` / `Brightness` / `Indices`
-aliases at the top of `main.py` rather than `np.ndarray`, which under strict is
-`ndarray[Any, dtype[Any]]` and tells you nothing. The tests aren't checked.
+FFmpeg must be available on `PATH`. The gallery can be a CIFAR-100 `train`
+pickle, a video, a directory of videos, or a video glob. Use
+`--gallery-type cifar|video` to choose explicitly. The CLI reads `config.toml`
+from the working directory when present; `--config` selects another TOML file
+and command-line flags override its values. See [CLI configuration](docs/cli.md)
+and [config.example.toml](config.example.toml).
 
-## Configuration
+## Tests and type checking
 
-User-supplied parameters live in the frozen `UserConfig` dataclass at the top of
-`main.py`, and are constructed in `parse_config()`. Edit that to change them;
-`--start` and `--duration` already have CLI flags:
+Tests build their own small FFV1 videos and CIFAR-format pickle, so the full
+source video and CIFAR dataset are not needed. Run the test suite with
+`uv run pytest`. The bare `uv run mypy` command checks the files listed under
+`[tool.mypy]` in `pyproject.toml`, covering the package and root entrypoints.
 
-- `input_dir` / `output_dir` — source video and output folder paths (the gallery
-  path is not a config field — it belongs to the `GallerySource` passed to `main()`)
-- `start` / `duration` — source seconds to process, default zero / to EOF.
-  `uv run main.py --start 60 --duration 10` selects frames 1800–2099 at 30 fps.
-  The skipped prefix replays random tile choices when `candidates > 1`, so a
-  slice matches the full run. Both the source pane and audio are trimmed too.
-  See `docs/streaming-and-encoding.md`
-- `grid_size` — multiplier for aspect ratio (higher = more tiles = finer detail,
-  slower). `grid_size=1` is single-frame mode: the grid collapses to 1×1 and each
-  source frame is replaced by one whole gallery image. No separate code path —
-  the cell simply becomes the frame. Note the memory cost: tiles are stored at
-  cell size, so a full-frame cell means the whole gallery is held at output
-  resolution (CIFAR at 512×384 is ~29 GB). Use a small gallery for this mode.
-- `tile_fit` — `native` (default), `crop` or `stretch`. Under `native` the cell
-  takes the gallery's own aspect ratio, so tiles are whole undistorted frames and
-  the grid gives way (Bad Apple at `grid_size=8` against 16:9 tiles: 18x24 of
-  28x16, not 32x24 of 16x16). `crop` and `stretch` keep the square-ish grid and
-  fit the image into it. On a square gallery like CIFAR the three usually agree,
-  but only by arithmetic — `native` reshapes the cell whatever the tiles are.
-  See `docs/tile-shape.md`
-- `contrast` — fraction of gallery brightness range to use (0–1); lower trims extremes for "cooler" results
-- `metric` — `colour` (default) or `brightness`. Colour quantises mean BGR onto a
-  `colour_bins`³ lattice; brightness matches on luma alone. Brightness throws
-  away two thirds of the signal, which costs most on a video gallery where
-  everything clusters in the mid-tones — against real CIFAR it reaches 33k of
-  50k images where colour reaches 50k. See `docs/colour-matching.md`
-- `candidates` — how many tiles each cell picks between; the variety knob, and gallery-independent (`1` pins every cell to its single closest tile)
-- `epsilon` — brightness only. Accuracy ceiling: max brightness error (0–1) a candidate may have. Caps `candidates` on a sparse gallery rather than letting it reach for tonally wrong tiles
-- `colour_bins` — colour only. Lattice edge, so `bins³` buckets; 2–64, default 32.
-  The accuracy knob, and it bites: at 8 a bucket spans 32 levels a channel and
-  Bad Apple's black background fills with grey tiles
-- `hold_tiles` — keep a cell's tile while its bucket key is unchanged (default
-  on). Without it every cell re-draws from its bucket every frame and static
-  regions boil: at `colour_bins=8` on Bad Apple, 99.4% of tiles changed per
-  frame against 6.9% with it on. Free, and a no-op at `candidates=1`
-- `seed` — RNG seed for the sampling; fixed seed = reproducible output
-- `gallery_budget` — bytes of tiles to refuse past (default 8 GB). `load_gallery()`
-  estimates `N × cell_h × cell_w × 3` before decoding anything and raises
-  `GalleryTooLarge` over this; over 1 GB it warns instead. Raise it if you really
-  do have the RAM. See `docs/gallery-size.md`
+The checkpoint code has POSIX and Windows locking implementations. The current
+verification environment is Linux, so Windows execution still needs testing.
 
-Everything derived from the source video — FPS (a `Fraction`, never rounded, so 29.97 stays 30000/1001), source/target dimensions, aspect
-ratio, grid and cell size — lives in `DerivedConfig`, built once by
-`probe_video()` and immutable thereafter.
+## Main behavior
 
-## Architecture
+- `--grid-size` chooses a grid multiplier. `--grid COLSxROWS` fixes the grid;
+  `--cell-size` sets cell height. `tile_fit` is `native`, `crop` or `stretch`.
+- The colour metric matches average BGR values on a 3D lattice. The brightness
+  metric matches luma and uses `epsilon` as an error ceiling. `contrast` trims
+  gallery brightness extremes. `candidates`, `stochastic` and `seed` control
+  tile selection.
+- `hold_tiles` keeps a cell's tile while its match bucket stays unchanged.
+- `start` and `duration` select a source-time slice. The source pane, mosaic
+  and audio share that slice. Seeded matching replays the skipped prefix so a
+  slice agrees with the same frames from a full run.
+- Video galleries use `stride` to sample frames and discard duplicate tiles.
+  Their frames are resized as they decode.
+- `gallery_budget` guards the resized tile array. Actual process memory may be
+  higher while gallery and metric arrays overlap; it is not a process-wide RAM
+  limit. See [gallery sizing](docs/gallery-size.md).
+- `use_cache` controls the `.npy` gallery cache. `segment` sets checkpointed
+  encode length; `0` disables segmentation. A rerun with the same inputs and
+  settings resumes validated segments. See [resume](docs/resume.md).
 
-Design rationale that doesn't fit in a comment lives in `docs/` (see
-`docs/README.md` for the index). Keep the comments in `main.py` short and put
-the *why* there instead.
+The full option list and defaults are in [README](README.md) and
+[docs/cli.md](docs/cli.md).
 
-The entire pipeline is single-file (`main.py`):
+## Module layout
 
-1. **`probe_video()`** — reads source metadata (FPS, dimensions) plus the gallery's `native_aspect` and returns a `DerivedConfig`, which derives an integer aspect pair from the source's own ratio (`Fraction(...).limit_denominator(16)`) and snaps target dimensions to the nearest grid multiple (`grid_size=1` is the exception: the grid is 1×1 and the cell is the whole frame), then nudges the grid a step where needed so both sides are even, which libx264's `yuv420p` insists on (a row step recounts the columns against the new height); **`stream_frames()`** then yields frames one at a time (never the whole video in RAM). Runs **first**, because the gallery cannot be loaded until the cell size is known
-2. **`GallerySource`** — protocol for tile sources: `load(cell_size)` returns `(N, cell_h, cell_w, 3)` BGR tiles **already at cell size**, `fingerprint` identifies what `load()` will return (files read, their mtimes, sampling parameters), and `estimate_count()` guesses the tile count cheaply (`None` if it can't). Full-resolution gallery frames are never stored (a season of anime at 1080p is 257 GB; at 16×16 it is 32 MB), so the protocol never promises them. `native_aspect` reports the ratio the source's own images are shaped to, which is what `tile_fit="native"` shapes the cell to. `CifarGallery(path)` wraps the CIFAR-100 pickle (`read_cifar_batch()` + `resize_gallery_to_cells()`); `VideoGallery(path, stride)` decodes a video or a directory of them, keeping every `stride`-th frame, downscaling it as it goes and dropping duplicate tiles (`docs/video-gallery.md`)
-3. **`load_gallery()`** — calls `source.load()` through an on-disk cache of `.npy` tile arrays under `.cache/gallery/`, keyed by `cache_key()` = sha256 of `(fingerprint, cell size)`. A hit skips the decode entirely (and the size estimate — it knows the real answer); writes go via a temp file and rename. `use_cache=False` bypasses the cache but not `check_gallery_budget()`. Metric precompute is *not* cached — it is ~10 ms against a 38 MB read
-4. **`gallery_brightness()`** — precomputes per-tile brightness scalars (0–1)
-5. **`shrink_gallery()`** — filters gallery to a percentile band around 50% brightness, controlled by `config.contrast`
-6. **`Metric`** — protocol for matchers: `precompute(gallery, cell_size, brightness=None)` builds the lookup and keeps only the tiles it can reach, `match(frame)` turns a whole frame into a `(grid_y, grid_x)` array of tile indices, `tiles` is what those index. Grid-wise, never cell-wise — a per-cell `score()` puts back the Python loop 0.1 removed. `BrightnessMetric` buckets the gallery into a 256-level table (one bucket per possible cell level, holding the `candidates` nearest images, none further than `epsilon`); `ColourMetric` buckets it onto a `colour_bins`³ BGR lattice, with a BFS fill so an empty lattice cell borrows the nearest occupied one. Both sample uniformly from the cell's bucket, resize nothing, and reject a gallery that is not already at cell size. `match()` splits into `keys(frame)` (which bucket a cell lands in) and `sample(keys)` (which tile it draws from that bucket), so `SteadyMetric` can wrap either metric and hold a cell's tile while its key is unchanged. See `docs/colour-matching.md`
-7. **`mosaic_frame()`** — assembles the matched tiles into a single mosaic frame; **`build_mosaics()`** maps it lazily over the frame stream (one frame in, one mosaic out, so peak memory never scales with video length)
-8. **`build_metric()`** — steps 4–6 as one stage: brightness, shrink, then `precompute()` on whichever `Metric` `config.metric` names, wrapped in `SteadyMetric` unless `hold_tiles` is off
-9. **`encode_video()`** — owns the ffmpeg pipe, writing raw mosaic frames to its stdin; **`combine_videos()`** runs ffmpeg again for the side-by-side output, scaling the source to the mosaic's size (`hstack` demands equal heights and the two only match by coincidence)
-10. **`main(gallery_source, config)`** — orchestration: probe → load → build metric → stream → mosaic → encode → combine. It takes a `GallerySource` and never touches CIFAR-specific code; `parse_config()` builds the `UserConfig` for `__main__`
+The code lives in the following package modules. Keep new code in
+the module that owns its behavior; the root scripts remain thin entrypoints.
 
-## Dependencies
+- `bad_apple/types.py` holds shared array and configuration types.
+- `bad_apple/config.py` owns user and derived configuration, validation and
+  geometry setup.
+- `bad_apple/gallery.py` owns gallery sources, CIFAR loading, video-gallery
+  decoding, cache keys and gallery budgets.
+- `bad_apple/metrics.py` owns brightness and colour matching and held-tile
+  behavior.
+- `bad_apple/video.py` owns source probing, frame streaming, mosaic encoding
+  and side-by-side output.
+- `bad_apple/pipeline.py` coordinates gallery loading, matching and video work.
+- `bad_apple/cli.py` owns CLI and TOML configuration.
+- `bad_apple/segments.py` owns checkpointed encoding and resume.
+- `main.py`, `cli.py` and `segments.py` provide the command and compatibility
+  entrypoints.
 
-Managed with `uv` (see `pyproject.toml`). Runtime deps: `opencv-python`, `numpy` (via opencv), `tqdm`. External: `ffmpeg`.
+Design decisions live in `docs/`, indexed by [docs/README.md](docs/README.md).
+Keep source comments short and put longer rationale in the relevant note.
 
 ## Voice
 
@@ -165,4 +132,4 @@ These mimic insight without providing any.
 
 1. Read it out loud. Does any sentence sound like a press release? Rewrite it.
 2. Are you repeating the same point in different words? Say it once.
-3. Does your opening sentence set the scene with a grand statement about the state of the world? Delete it, start with the second sentence.Copy
+3. Does your opening sentence set the scene with a grand statement about the state of the world? Delete it, start with the second sentence.

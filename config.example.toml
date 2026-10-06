@@ -5,7 +5,7 @@ gallery = "./assets/gallery/train"
 
 output_dir = "./output"
 grid_size = 8
-# grid = "32x24" # fixed columns x rows, when supported by the selected pipeline
+# grid = "32x24" # fixed columns x rows
 # cell_size = 16
 tile_fit = "native"
 contrast = 0.8

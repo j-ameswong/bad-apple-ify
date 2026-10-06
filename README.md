@@ -7,107 +7,125 @@
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-171717?logo=ffmpeg&logoColor=5cb85c)](https://ffmpeg.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-<p align="center">
-    <img align="center" src="./docs/images/preview.gif">
-</p>
+<p align="center"><img src="docs/images/preview.gif" alt="Photo mosaic video preview"></p>
 
 <p align="center"><i>Make your own Bad Apple!</i></p>
 
-## What is this?
+bad-apple-ify rebuilds each frame of a video as a mosaic. It matches every
+video cell to an image from a gallery, then writes both the mosaic and a
+side-by-side video with the original audio.
 
-A fun side project that takes a video and reconstructs each frame as a **photo mosaic**, where every tile is a real image pulled from a gallery based on brightness matching. Originally inspired by Bad Apple, but it works on any video!
+## Requirements and setup
 
-The output is a side-by-side video of the original and the mosaic version, stitched together with the original audio.
+- Python 3.14 or later
+- [uv](https://docs.astral.sh/uv/) for installing and running the project
+- [FFmpeg](https://ffmpeg.org/) available on `PATH`
+- NumPy, OpenCV and tqdm (installed by `uv sync`)
+- A gallery: a CIFAR-100 Python `train` batch, a video, a directory of videos,
+  or a video glob
 
-## How it works
+Install the dependencies and place a source video and CIFAR batch as follows:
 
-Each frame of the source video gets divided into a grid of cells. For every cell, the script calculates the average brightness and finds the closest-matching image from a gallery (currently using CIFAR-100). The matched images are tiled together to recreate the frame as a mosaic, and all the mosaic frames are stitched into a video using ffmpeg.
-
-The pipeline looks like this:
-
-1. **Load gallery** — read CIFAR-100 images and optionally trim the brightness extremes for better contrast
-2. **Extract frames** — pull every frame from the source video
-3. **Build mosaics** — for each frame, split into a grid, match each cell's brightness against the gallery, and composite the best matches into a mosaic frame
-4. **Stitch** — ffmpeg combines the mosaic frames into a video, then places it side-by-side with the original (including audio)
-
-## Gallery
-
-The brightness matching is super simple: it's just comparing scalar averages, but it works surprisingly well, especially on high-contrast videos like Bad Apple. The `contrast` parameter controls how much of the gallery's brightness range to use: lower values trim the extremes and give "cooler" results, while `1.0` uses the full gallery.
-
-## Requirements
-
-- Python 3.14+
-- [uv](https://github.com/astral-sh/uv) for package management (recommended but you can use something else)
-- [ffmpeg](https://ffmpeg.org/) installed and on your PATH
-- A CIFAR-100 dataset file (the `train` batch in pickle format) placed in `./assets/gallery/`
-
-## Usage
-
-1. Download dependencies with `uv sync`
-2. Place your source video at `./assets/source.mp4` (or update the path in `main.py`)
-3. Download the CIFAR-100 train batch into `./assets/gallery/train`:
-
-```
+```sh
+uv sync
+mkdir -p assets/gallery
 wget https://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz
 tar -xzf cifar-100-python.tar.gz
-mv cifar-100-python/train ./assets/gallery/
-rm -rf cifar-100-python cifar-100-python.tar.gz
+mv cifar-100-python/train assets/gallery/
+uv run cli.py --source assets/source.mp4 --gallery assets/gallery/train
 ```
 
-5. `uv run main.py`
+The gallery type is inferred from the path when possible. Pass
+`--gallery-type cifar` or `--gallery-type video` to choose explicitly. A video
+gallery may be one video, a directory, or a glob such as `'./clips/*.mkv'`;
+`--stride` selects every Nth decoded frame (default 10).
 
-The script will output the mosaic video and a combined side-by-side version in `./output/`.
-
-To try a ten-second slice starting one minute into the source:
-
-```bash
-uv run main.py --start 60 --duration 10
-```
-
-Both outputs, including the combined video's audio, use that slice. Times are
-in seconds and can be fractional. Omit `--start` to begin at zero, or omit
-`--duration` to continue to the end. See [streaming and slicing](docs/streaming-and-encoding.md)
-for frame boundaries and how seeded tile choices are preserved.
+The output directory contains `output.mp4` (the mosaic) and `combined.mp4`
+(source beside mosaic, with audio). The gallery cache is stored in
+`.cache/gallery/` by default. Run `uv run cli.py --help` for the current flags.
 
 ## Configuration
 
-The parameters live in the `UserConfig` dataclass in `main.py`. `parse_config()`
-constructs the command-line defaults; `--start` and `--duration` override its
-slice settings. Other settings can be changed there until the full CLI lands.
+The CLI reads `config.toml` in the current directory when it exists. Choose a
+different file with `--config path/to/file.toml`. Paths in TOML are relative to
+that file; paths in command-line flags are relative to the current directory.
+Command-line values override TOML values. The repository includes a complete
+[config.example.toml](config.example.toml).
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `grid_size` | 8 | Multiplier for aspect ratio |
-| `contrast` | 1.0 | Gallery brightness range (0–1). Lower values trim dark/bright extremes |
-| `start` | `0` | First source time to process, in seconds |
-| `duration` | `None` | Seconds to process; `None` continues to the end |
+| TOML key / flag | Default | Effect |
+|---|---:|---|
+| `source` / `--source` | required | Input video path |
+| `gallery` / `--gallery` | required | CIFAR pickle, video, directory or glob |
+| `gallery_type` / `--gallery-type` | inferred | `cifar` or `video` |
+| `output_dir` / `--output-dir` | `./output` | Output and resume files |
+| `grid_size` / `--grid-size` | `8` | Grid density multiplier |
+| `grid` / `--grid` | unset | Fixed `COLSxROWS` grid |
+| `cell_size` / `--cell-size` | unset | Cell height in pixels |
+| `tile_fit` / `--tile-fit` | `native` | `native`, `crop` or `stretch` |
+| `contrast` / `--contrast` | `0.8` | Central fraction of images to retain by brightness percentile (ties may retain more) |
+| `metric` / `--metric` | `colour` | Match on colour or brightness |
+| `candidates` / `--candidates` | `256` | Choices sampled from each match bucket |
+| `epsilon` / `--epsilon` | `0.005` | Brightness-match error ceiling |
+| `colour_bins` / `--colour-bins` | `32` | Colour lattice edge, from 2 to 64 |
+| `stochastic` / `--stochastic`, `--no-stochastic` | `true` | Sample candidates; false pins one candidate |
+| `seed` / `--seed` | `0` | Reproducible random choices |
+| `hold_tiles` / `--hold-tiles`, `--no-hold-tiles` | `true` | Keep a cell's tile while its match bucket stays the same |
+| `start` / `--start` | `0` seconds | Start time in the source |
+| `duration` / `--duration` | unset | Slice length; unset means to EOF |
+| `stride` / `--stride` | `10` | Frames between samples in a video gallery |
+| `segment` / `--segment` | `5000` frames | Checkpointed encode length; `0` disables resume |
+| `use_cache` / `--cache`, `--no-cache` | `true` | Read/write or bypass the tile cache |
+| `gallery_budget` / `--gallery-budget` | `8G` | Maximum tile-array bytes; accepts bytes or K/M/G/T |
+| `dry_run` / `--dry-run` | `false` | Probe and check the estimated gallery size without processing |
 
-Higher grid values = more tiles = finer detail but slower processing. The grid is independent of the source resolution, the cell size is calculated automatically.
+For example, process a ten-second slice, or estimate a video gallery before
+decoding it:
 
-## Dependencies
+```sh
+uv run cli.py --source assets/source.mp4 --gallery assets/gallery/train \
+  --start 60 --duration 10 --grid-size 8
 
-- `opencv-python` — video/image processing
-- `numpy` — all the number crunching
-- `tqdm` — progress bars (essential for sanity)
+uv run cli.py --source assets/source.mp4 --gallery './clips/*.mkv' \
+  --gallery-type video --stride 10 --gallery-budget 2G --dry-run
+```
 
-## Performance
+See [CLI and TOML configuration](docs/cli.md) for precedence, validation and
+more examples. See [segmented encoding and resume](docs/resume.md) to continue
+an interrupted run with the same settings.
 
-~10 minute processing and stitching for a 512x384 video using 32GB RAM on an i9-13900H with max contrast
+## Matching and memory
 
-## Limitations
+The default colour metric puts each cell's mean BGR colour into a 3D lattice
+and finds gallery tiles from that bucket. The brightness metric matches luma
+alone. `contrast` trims the darkest and brightest gallery images before either
+metric is built. With `hold_tiles`, a cell keeps its selected image until its
+match bucket changes, which reduces flicker. Details and trade-offs are in
+[matching metrics](docs/colour-matching.md) and
+[brightness matching](docs/brightness-matching.md).
 
-This is a weekend project, so there are some known rough edges:
+Frames are decoded and processed as a stream, so memory use does not grow with
+source-video duration. The resized gallery tiles do stay in memory, and metric
+precomputation can temporarily hold additional arrays. `gallery_budget` guards
+the tile array and warns or refuses based on the estimate; it does not cap all
+process memory. A larger cell or gallery may need substantially more RAM. See
+[gallery sizing](docs/gallery-size.md).
 
-- CIFAR-100 images are only 32×32, so tiles look blurry up close. A higher-res gallery would look much better
-- The brightness matching is a single scalar per tile — no colour or texture matching (yet?)
-- The whole video gets loaded into memory, so very long videos will eat your RAM
-- ~~Frame dimensions need to be evenly divisible by `grid_x` and `grid_y`~~ Frame dimensions now snap to the nearest `config.ASPECT_RATIO`!
+## Development
+
+```sh
+uv run pytest
+uv run mypy
+```
+
+The tests make their own small videos and galleries; source media and the full
+CIFAR download are not needed. The code includes POSIX and Windows checkpoint
+locking paths, but verification has been run on Linux.
 
 ## Acknowledgements
 
-- [Bad Apple!!](https://www.nicovideo.jp/watch/sm8628149) — the classic
-- [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html) — for the gallery images
+- [Bad Apple!!](https://www.nicovideo.jp/watch/sm8628149) for the inspiration
+- [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html) for its image batch
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

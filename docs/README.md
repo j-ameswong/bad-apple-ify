@@ -1,9 +1,13 @@
 # Docs
 
-Design notes for the bits of `main.py` where the *why* doesn't fit in a comment.
+- [Python audit](audit.md) — confirmed fixes, performance decisions and validation limits
 
+Guides and design notes for using and changing the Python pipeline.
+
+- [CLI and TOML configuration](cli.md) — flags, defaults, path rules and examples
+- [Segmented encoding and resume](resume.md) — checkpoints, validation and reruns
 - [Grid and sizing](grid-and-sizing.md) — aspect ratio derivation, cell size, single-frame mode
-- [Gallery sources](gallery-sources.md) — the `GallerySource` protocol and why `load()` takes a cell size
+- [Gallery sources](gallery-sources.md) — the `GallerySource` protocol, CIFAR and video sources
 - [Video galleries](video-gallery.md) — decoding a season into tiles: stride, dedupe, the buffer
 - [Tile shape](tile-shape.md) — `tile_fit`, how native-ratio tiles reshape the grid, and resampling
 - [The tile cache](gallery-cache.md) — what's cached, how it's keyed, how it's written
