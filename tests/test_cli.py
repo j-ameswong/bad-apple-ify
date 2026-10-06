@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+
 import cli
 
 
@@ -150,3 +151,18 @@ def test_dry_run_rejects_missing_or_unreadable_video_gallery(
     assert result == 2
     assert "error:" in capsys.readouterr().err
     assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("budget", ["abc", "1e308G"])
+def test_invalid_toml_budget_reports_an_error(tmp_path, monkeypatch, capsys, budget):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        f'source = "source.mp4"\ngallery = "train"\ngallery_budget = "{budget}"\n')
+    assert cli.cli_main([]) == 2
+    assert "gallery_budget" in capsys.readouterr().err
+
+
+def test_overflowing_cli_budget_reports_an_error(capsys):
+    assert cli.cli_main(["--source", "source.mp4", "--gallery", "train",
+                         "--gallery-budget", "1e308G"]) == 2
+    assert "size is too large" in capsys.readouterr().err

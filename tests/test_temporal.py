@@ -104,3 +104,20 @@ def test_build_metric_honours_hold_tiles(cell_gallery):
                      colour_bins=8, candidates=16, contrast=1.0,
                      hold_tiles=False)
     assert isinstance(build_metric(cell_gallery, off, derived), ColourMetric)
+
+
+def test_reprecompute_discards_choices_from_the_previous_gallery():
+    steady = SteadyMetric(ColourMetric(bins=8, candidates=2, seed=0))
+    gallery = np.full((2, 1, 1, 3), 128, dtype=np.uint8)
+    frame = gallery[0]
+    steady.precompute(gallery, (1, 1))
+    assert steady.match(frame).item() == 1
+    steady.precompute(gallery[:1], (1, 1))
+    assert steady.match(frame).item() == 0
+
+
+def test_changing_frame_geometry_starts_a_new_held_grid(metric):
+    steady = SteadyMetric(metric)
+    steady.match(flat_frame(128))
+    larger = np.full((CELL[1] * 4, CELL[0] * 5, 3), 128, dtype=np.uint8)
+    assert steady.match(larger).shape == (4, 5)

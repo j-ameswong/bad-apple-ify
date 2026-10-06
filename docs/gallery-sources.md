@@ -4,6 +4,10 @@
 returns `(N, cell_h, cell_w, 3)` BGR tiles, plus a `fingerprint` string and an
 `estimate_count()`.
 
+The built-in file-backed sources also expose `input_paths`, a read-only tuple
+of resolved paths they read. Orchestration uses it to avoid replacing a source
+gallery with an output file; custom sources need not implement this property.
+
 ## Why `load()` takes the cell size
 
 This is the point of the protocol, not a convenience. A video gallery is only
@@ -19,9 +23,10 @@ size derived before any gallery can load. That's why `main()` calls
 ## The fingerprint
 
 `fingerprint` identifies what `load()` will return, ignoring cell size:
-everything that changes the tiles (the files read, their mtimes, any sampling
-parameters) and nothing that doesn't. The [tile cache](gallery-cache.md) keys on
-it, so a source that under-reports here will happily serve stale tiles.
+everything that changes the tiles (the files read, their modification times and
+sizes, any sampling parameters) and nothing that doesn't. The
+[tile cache](gallery-cache.md) keys on it, so a source that under-reports here
+will happily serve stale tiles.
 
 ## The shape of a tile
 
@@ -42,7 +47,14 @@ for a decode. Over-reporting is harmless, under-reporting defeats the point, and
 ## Implementations
 
 `CifarGallery` wraps a CIFAR-100 pickle batch: 32x32 images, resized to cell
-size at load time.
+size at load time. Its unpickler only accepts NumPy's array reconstruction and
+buffer constructors, dtype and scalar globals, which cover legacy CIFAR files
+and current NumPy fixtures; other pickle globals are rejected so a gallery
+file cannot run arbitrary Python code. The `data` member must be a non-empty
+uint8 `(N, 3072)` array.
+Malformed pickle streams are reported as `ValueError`, so the command line
+shows a concise gallery error. Empty or too-small files fail during the cheap
+count estimate as well, including in dry runs.
 
 Two quirks in `read_cifar_batch()`. The pickle carries a dtype serialised by an
 ancient NumPy with `align=0`, which NumPy 2.4 deprecates in its int form;

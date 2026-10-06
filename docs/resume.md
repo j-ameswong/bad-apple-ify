@@ -22,4 +22,8 @@ complete.
 All runs with segmentation enabled use the same fixed boundaries, so a resumed
 run decodes to the same frames as an uninterrupted run with the same settings.
 The independently encoded parts can have different bytes from one unsegmented
-encode.
+encode. Concurrent segmented runs for the same output directory are rejected
+with an OS file lock: POSIX uses `flock`, and Windows uses a one-byte `msvcrt`
+lock. Final concatenation also uses a temporary file, so a failed concat leaves
+the previous output in place. Directory syncing after atomic replacement is
+used on POSIX; Windows does not support opening directories for this sync.

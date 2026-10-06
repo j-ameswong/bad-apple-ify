@@ -5,8 +5,11 @@ gallery — so the tests here are mostly about *not* calling `load()`.
 """
 
 import errno
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import numpy as np
 import pytest
@@ -100,6 +103,18 @@ def test_touching_the_gallery_file_misses(cache_dir, cifar_pickle, tmp_path):
     assert cache_key(CifarGallery(path), CELL) != before
 
 
+def test_changing_file_size_misses_even_when_mtime_is_restored(
+        cache_dir, cifar_pickle):
+    path, _ = cifar_pickle
+    source = CifarGallery(path)
+    before = cache_key(source, CELL)
+    stat = path.stat()
+    path.write_bytes(path.read_bytes() + b"extra")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    assert cache_key(source, CELL) != before
+
+
 def test_no_cache_bypasses_it_entirely(cache_dir, cell_gallery):
     source = CountingSource(cell_gallery)
     derived = derived_for(CELL)
@@ -153,6 +168,20 @@ def test_wrong_dtype_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
 
     assert source.loads == 2
     assert tiles.dtype == np.uint8
+
+
+def test_empty_cache_falls_back_to_a_reload(cache_dir, cell_gallery):
+    source = CountingSource(cell_gallery)
+    derived = derived_for(CELL)
+    load_gallery(source, derived, cache_dir=cache_dir)
+
+    cached_file, = cache_dir.glob("*.npy")
+    np.save(cached_file, np.empty((0, CELL[1], CELL[0], 3), dtype=np.uint8))
+
+    tiles = load_gallery(source, derived, cache_dir=cache_dir)
+
+    assert source.loads == 2
+    assert len(tiles) > 0
 
 
 def flip(data: bytes, index: int, bit: int) -> bytes:
@@ -246,6 +275,30 @@ def test_a_failed_write_leaves_nothing_behind(cache_dir, cell_gallery, monkeypat
                      cache_dir=cache_dir)
 
     assert list(cache_dir.iterdir()) == []
+
+
+def test_parallel_writes_get_distinct_temporary_names(cache_dir, cell_gallery,
+                                                       monkeypatch):
+    source = CountingSource(cell_gallery)
+    barrier = Barrier(2)
+    names = []
+    real_save = np.save
+
+    def concurrent_save(file, arr, allow_pickle=True):
+        names.append(Path(file).name)
+        barrier.wait(timeout=5)
+        real_save(file, arr, allow_pickle=allow_pickle)
+
+    monkeypatch.setattr(np, "save", concurrent_save)
+    derived = derived_for(CELL)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda _: load_gallery(source, derived, cache_dir=cache_dir), range(2)))
+
+    assert len(names) == 2
+    assert names[0] != names[1]
+    assert len(list(cache_dir.glob("*.tmp.npy"))) == 0
+    np.testing.assert_array_equal(results[0], results[1])
 
 
 def test_cache_key_is_filename_safe(cell_gallery):

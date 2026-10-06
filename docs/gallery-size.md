@@ -37,6 +37,11 @@ stays an upper bound.
 `None` means "can't tell", which is not the same as "small". It's reported as
 unknown rather than waved through as zero.
 
+The estimate is a pre-load guard, not the final authority. CIFAR checks the
+decoded row count before resizing, and `load_gallery()` checks the returned
+tile array's real bytes against the same budget. A source that underestimates
+cannot return an oversized tile array silently.
+
 ## What the number does and doesn't cover
 
 It prices the tile array itself. `resize_gallery_to_cells()` fills a single

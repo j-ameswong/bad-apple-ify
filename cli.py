@@ -84,7 +84,10 @@ def _budget(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a byte count, optionally with K/M/G/T") from error
     if not math.isfinite(amount) or amount <= 0:
         raise argparse.ArgumentTypeError("must be a finite, positive size")
-    result = int(amount * multiplier)
+    scaled = amount * multiplier
+    if not math.isfinite(scaled):
+        raise argparse.ArgumentTypeError("size is too large")
+    result = int(scaled)
     if result <= 0:
         raise argparse.ArgumentTypeError("size must be at least one byte")
     return result
@@ -256,7 +259,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunOptions:
     if not values["stochastic"]:
         values["candidates"] = 1
     budget_value = values["gallery_budget"]
-    budget = _budget(str(budget_value)) if isinstance(budget_value, str) else int(cast(int, budget_value))
+    try:
+        budget = _budget(str(budget_value)) if isinstance(budget_value, str) else int(cast(int, budget_value))
+    except argparse.ArgumentTypeError as error:
+        raise ValueError(f"gallery_budget {error}") from error
     if budget <= 0:
         raise ValueError("gallery_budget must be positive")
     values["gallery_budget"] = budget

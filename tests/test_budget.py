@@ -62,6 +62,14 @@ def test_cifar_estimate_is_exact_on_a_synthetic_batch(cifar_pickle):
     assert CifarGallery(path).estimate_count() == len(expected)
 
 
+def test_empty_cifar_file_fails_during_estimation(tmp_path):
+    path = tmp_path / "empty"
+    path.touch()
+
+    with pytest.raises(ValueError, match="CIFAR gallery file is empty"):
+        CifarGallery(path).estimate_count()
+
+
 REAL_CIFAR = Path("assets/gallery/train")
 
 
@@ -260,6 +268,37 @@ def test_a_raised_budget_lets_it_through():
     tiles = load_gallery(source, derived, use_cache=False, budget=1 << 30)
 
     assert len(tiles) == 4
+
+
+def test_actual_count_is_budgeted_when_estimate_is_too_low():
+    class UnderestimatingSource(TinySource):
+        def estimate_count(self):
+            return 1
+
+        def load(self, cell_size, fit="native", budget=HARD_BUDGET):
+            cell_w, cell_h = cell_size
+            return np.zeros((4, cell_h, cell_w, 3), dtype=np.uint8)
+
+    source, derived = UnderestimatingSource(1), derived_for(CELL)
+
+    with pytest.raises(GalleryTooLarge):
+        load_gallery(source, derived, use_cache=False, budget=100)
+
+
+@pytest.mark.parametrize("tiles", [
+    np.empty((0, 4, 4, 3), dtype=np.uint8),
+    np.zeros((2, 3, 4, 3), dtype=np.uint8),
+    np.zeros((2, 4, 4, 1), dtype=np.uint8),
+    np.zeros((2, 4, 4, 3), dtype=np.float32),
+])
+def test_gallery_source_output_is_validated(tiles):
+    class InvalidSource(TinySource):
+        def load(self, cell_size, fit="native", budget=HARD_BUDGET):
+            return tiles
+
+    source = InvalidSource(1)
+    with pytest.raises(ValueError, match="non-empty uint8 array"):
+        load_gallery(source, derived_for(CELL), use_cache=False)
 
 
 def test_under_the_soft_budget_is_an_ordinary_line(capsys):

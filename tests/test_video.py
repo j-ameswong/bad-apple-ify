@@ -102,3 +102,32 @@ def test_missing_video_raises(tmp_path):
     config = UserConfig(input_dir=str(tmp_path / "nope.mkv"), output_dir="")
     with pytest.raises(ValueError):
         probe_video(config)
+
+
+def test_probe_video_releases_capture_when_metadata_is_invalid(video, monkeypatch):
+    import cv2
+
+    path, _ = video
+    real_capture = cv2.VideoCapture
+    released = []
+
+    class InvalidRateCapture:
+        def __init__(self, name):
+            self._capture = real_capture(name)
+
+        def isOpened(self):
+            return self._capture.isOpened()
+
+        def get(self, prop):
+            if prop == cv2.CAP_PROP_FPS:
+                return float("nan")
+            return self._capture.get(prop)
+
+        def release(self):
+            released.append(True)
+            self._capture.release()
+
+    monkeypatch.setattr(main.cv2, "VideoCapture", InvalidRateCapture)
+    with pytest.raises(ValueError, match="invalid frame rate"):
+        probe_video(UserConfig(input_dir=str(path), output_dir=""))
+    assert released == [True]

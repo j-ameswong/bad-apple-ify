@@ -1,5 +1,6 @@
 from typing import Callable, Iterator, Literal, Protocol, cast
 import argparse
+import importlib
 import numpy as np
 import numpy.typing as npt
 import cv2
@@ -16,6 +17,7 @@ from math import ceil, isfinite
 from pathlib import Path
 from dataclasses import dataclass
 import subprocess
+import tempfile
 
 type Image = npt.NDArray[np.uint8]
 type Brightness = npt.NDArray[np.float64]
@@ -89,9 +91,11 @@ class UserConfig:
             raise ValueError("segment_frames must be a non-negative integer")
         if not isinstance(self.hold_tiles, bool) or not isinstance(self.use_cache, bool):
             raise ValueError("hold_tiles and use_cache must be booleans")
-        if isinstance(self.start, bool) or not isfinite(self.start) or self.start < 0:
+        if isinstance(self.start, bool) or not isinstance(self.start, (int, float)) \
+                or not isfinite(self.start) or self.start < 0:
             raise ValueError("start must be a finite, non-negative number of seconds")
         if self.duration is not None and (isinstance(self.duration, bool)
+                                          or not isinstance(self.duration, (int, float))
                                           or not isfinite(self.duration)
                                           or self.duration <= 0):
             raise ValueError("duration must be a finite, positive number of seconds")
@@ -341,13 +345,51 @@ FALLBACK_CAPACITY = 1024
 
 def read_cifar_batch(path: Path) -> Image:
     """Read a CIFAR pickle batch as an (N, 32, 32, 3) BGR array."""
+    class CifarUnpickler(pickle.Unpickler):
+        """Only construct NumPy arrays used by the legacy CIFAR files."""
+
+        _numpy_globals = {
+            (module, name): value
+            for module in ("numpy.core.multiarray", "numpy._core.multiarray")
+            for name, value in (("_reconstruct", getattr(
+                importlib.import_module("numpy._core.multiarray"), "_reconstruct")),
+                                ("scalar", getattr(
+                importlib.import_module("numpy._core.multiarray"), "scalar")))
+        }
+        _numpy_globals.update({
+            (module, "_frombuffer"): getattr(
+                importlib.import_module("numpy._core.numeric"), "_frombuffer")
+            for module in ("numpy.core.numeric", "numpy._core.numeric")
+        })
+        _numpy_globals.update({
+            ("numpy", "ndarray"): np.ndarray,
+            ("numpy", "dtype"): np.dtype,
+        })
+
+        def find_class(self, module: str, name: str) -> object:
+            try:
+                return self._numpy_globals[(module, name)]
+            except KeyError as error:
+                raise pickle.UnpicklingError(
+                    f"CIFAR pickle requested unsupported global {module}.{name}") from error
+
     with open(path, 'rb') as fo:
         with warnings.catch_warnings():
             # Ancient NumPy pickled the dtype with `align=0`, which 2.4
             # deprecates. Not fixable short of re-serialising the file.
             warnings.filterwarnings("ignore", message=".*align=0.*")
-            data = pickle.load(fo, encoding='latin1')
-        images = data['data']
+            try:
+                data = CifarUnpickler(fo, encoding='latin1').load()
+            except (pickle.UnpicklingError, EOFError, ValueError, TypeError,
+                    AttributeError, IndexError, ImportError, OverflowError) as error:
+                raise ValueError(f"Invalid CIFAR pickle at {path}: {error}") from error
+        if not isinstance(data, dict) or "data" not in data:
+            raise ValueError("CIFAR pickle must contain a 'data' array")
+        images = data["data"]
+        if (not isinstance(images, np.ndarray) or images.dtype != np.uint8
+                or images.ndim != 2 or images.shape[0] == 0
+                or images.shape[1] != CIFAR_IMAGE_BYTES):
+            raise ValueError("CIFAR 'data' must be a non-empty uint8 array of shape (N, 3072)")
 
         # reminder to self, transpose works by putting in the old positions
         rgb = images.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
@@ -362,8 +404,14 @@ class CifarGallery:
         self._path = Path(path)
 
     @property
+    def input_paths(self) -> tuple[Path, ...]:
+        """Files this gallery reads, for protecting them from output paths."""
+        return (self._path.resolve(),)
+
+    @property
     def fingerprint(self) -> str:
-        return f"cifar:{self._path.resolve()}:{self._path.stat().st_mtime_ns}"
+        stat = self._path.stat()
+        return f"cifar:{self._path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
 
     @property
     def native_aspect(self) -> tuple[int, int] | None:
@@ -372,13 +420,18 @@ class CifarGallery:
     def estimate_count(self) -> int | None:
         # Labels and filenames pad the pickle, so this reads 1.1% high on the
         # real train batch (50537 against 50000). Fine for a budget.
-        return self._path.stat().st_size // CIFAR_IMAGE_BYTES
+        size = self._path.stat().st_size
+        if size == 0:
+            raise ValueError(f"CIFAR gallery file is empty: {self._path}")
+        if size < CIFAR_IMAGE_BYTES:
+            raise ValueError(f"CIFAR gallery file is too small to contain an image: {self._path}")
+        return size // CIFAR_IMAGE_BYTES
 
     def load(self, cell_size: tuple[int, int], fit: Fit = "native",
              budget: int = HARD_BUDGET) -> Image:
-        # The pickle's count is known before any resizing, so nothing can grow
-        # past what the estimate already priced.
-        return resize_gallery_to_cells(read_cifar_batch(self._path), cell_size, fit)
+        images = read_cifar_batch(self._path)
+        enforce_gallery_budget(len(images), cell_size, budget)
+        return resize_gallery_to_cells(images, cell_size, fit)
 
 
 class TileBuffer:
@@ -462,8 +515,15 @@ class VideoGallery:
         return files
 
     @property
+    def input_paths(self) -> tuple[Path, ...]:
+        """Video files this gallery reads, in decode order."""
+        return tuple(path.resolve() for path in self._files())
+
+    @property
     def fingerprint(self) -> str:
-        files = ",".join(f"{p.resolve()}:{p.stat().st_mtime_ns}" for p in self._files())
+        files = ",".join(
+            f"{p.resolve()}:{p.stat().st_mtime_ns}:{p.stat().st_size}"
+            for p in self._files())
         return f"video:{files}:stride={self._stride}"
 
     @property
@@ -475,9 +535,14 @@ class VideoGallery:
         """
         files = self._files()
         cap = cv2.VideoCapture(str(files[0]))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
+        try:
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        finally:
+            cap.release()
+        if not isfinite(width) or not isfinite(height):
+            return None
+        width, height = int(width), int(height)
         if width <= 0 or height <= 0:
             return None
         ratio = Fraction(width, height)
@@ -496,23 +561,35 @@ class VideoGallery:
 
     def _scan_count(self) -> int | None:
         total = 0
+        unknown_count = False
         for path in self._files():
             cap = cv2.VideoCapture(str(path))
-            if not cap.isOpened():
+            try:
+                if not cap.isOpened():
+                    raise ValueError(f"Video at {path} could not be opened!")
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                if not isfinite(frames):
+                    unknown_count = True
+                    continue
+                if frames <= 0:
+                    # Nothing in the container; seek to the end for a duration instead.
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+                    ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if not isfinite(fps) or not isfinite(ms):
+                        unknown_count = True
+                        continue
+                    frames = fps * ms / 1000.0 if fps > 0 and ms > 0 else 0
+                if not isfinite(frames):
+                    unknown_count = True
+                    continue
+            finally:
                 cap.release()
-                raise ValueError(f"Video at {path} could not be opened!")
-            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             if frames <= 0:
-                # Nothing in the container; seek to the end for a duration instead.
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-                ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                frames = fps * ms / 1000.0 if fps > 0 and ms > 0 else 0
-            cap.release()
-            if frames <= 0:
-                return None
+                unknown_count = True
+                continue
             total += -(-int(frames) // self._stride)
-        return total
+        return None if unknown_count else total
 
     def load(self, cell_size: tuple[int, int], fit: Fit = "native",
              budget: int = HARD_BUDGET) -> Image:
@@ -656,7 +733,7 @@ def read_cached_tiles(path: Path, cell_size: tuple[int, int],
             # numpy's parser throws all four on a mangled header, not just ValueError.
             return None
 
-        if (dtype != np.uint8 or fortran_order or len(shape) != 4
+        if (dtype != np.uint8 or fortran_order or len(shape) != 4 or shape[0] <= 0
                 or shape[1:] != (cell_h, cell_w, 3)):
             return None
         # A truncated file has an honest header and too few bytes behind it.
@@ -697,13 +774,25 @@ def load_gallery(source: GallerySource, derived: DerivedConfig, *,
     # A hit prices the real count above; only a decode needs the estimate.
     check_gallery_budget(source, cell_size, budget)
     tiles = source.load(cell_size, fit, budget)
+    expected_shape = (tiles.shape[0], cell_size[1], cell_size[0], 3) \
+        if isinstance(tiles, np.ndarray) and tiles.ndim == 4 else None
+    if (expected_shape is None or tiles.shape[0] <= 0
+            or tiles.shape != expected_shape or tiles.dtype != np.uint8):
+        raise ValueError(
+            "Gallery source must return a non-empty uint8 array shaped "
+            f"(N, {cell_size[1]}, {cell_size[0]}, 3)")
+    # Estimates can be low or stale. Check the actual returned tile bytes too.
+    enforce_gallery_budget(len(tiles), cell_size, budget)
     if not use_cache:
         return tiles
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     # Write-then-rename, so a run killed mid-write leaves the old cache intact.
     # Keeps the .npy suffix, which np.save would otherwise append itself.
-    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp.npy")
+    fd, temp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp.npy",
+                                     dir=cache_dir)
+    os.close(fd)
+    temp = Path(temp_name)
     try:
         np.save(temp, tiles, allow_pickle=False)
         temp.replace(path)
@@ -727,15 +816,26 @@ def probe_video(config: UserConfig,
     """Read source video metadata and derive the grid, cell and target size."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
+        cap.release()
         raise ValueError(f"Video at {config.input_dir} not found!")
 
-    # A double of n/1001 snaps straight back. See docs/streaming-and-encoding.md.
-    fps = Fraction(cap.get(cv2.CAP_PROP_FPS)).limit_denominator(1001)
-    dimensions = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                  int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    # Container metadata, used only as a tqdm display hint — may be inaccurate.
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    cap.release()
+    try:
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not isfinite(raw_fps) or raw_fps <= 0:
+            raise ValueError(f"source video has invalid frame rate: {raw_fps}")
+        # A double of n/1001 snaps straight back. See docs/streaming-and-encoding.md.
+        fps = Fraction(raw_fps).limit_denominator(1001)
+        raw_dimensions = (cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+                          cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not all(isfinite(value) for value in raw_dimensions):
+            raise ValueError(f"source video has invalid dimensions: {raw_dimensions}")
+        dimensions = (int(raw_dimensions[0]), int(raw_dimensions[1]))
+        # Container metadata, used only as a tqdm display hint — may be inaccurate.
+        raw_frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        frame_count = (int(raw_frame_count) if isfinite(raw_frame_count)
+                       and raw_frame_count > 0 else 0)
+    finally:
+        cap.release()
 
     derived = DerivedConfig.from_source(config, fps=fps, dimensions=dimensions,
                                         frame_count=frame_count,
@@ -755,6 +855,7 @@ def stream_frames(config: UserConfig, derived: DerivedConfig, *,
     """
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
+        cap.release()
         raise ValueError(f"Video at {config.input_dir} not found!")
 
     try:
@@ -1059,6 +1160,7 @@ class SteadyMetric:
     def precompute(self, gallery: Image, cell_size: tuple[int, int],
                    brightness: Brightness | None = None) -> None:
         self._inner.precompute(gallery, cell_size, brightness)
+        self._previous = None
 
     def keys(self, frame: Image) -> Indices:
         return self._inner.keys(frame)
@@ -1067,7 +1169,7 @@ class SteadyMetric:
         # Draws for every cell and throws most of it away — cheaper than the
         # bookkeeping a partial draw needs.
         picks = self._inner.sample(keys)
-        if self._previous is not None:
+        if self._previous is not None and self._previous[0].shape == keys.shape:
             last_keys, last_picks = self._previous
             picks = np.where(keys == last_keys, last_picks, picks)
         self._previous = (keys, picks)
@@ -1152,37 +1254,84 @@ def build_mosaics(frames: Iterator[Image], metric: Metric,
 
 def encode_video(mosaics: Iterator[Image], derived: DerivedConfig,
                  output_path: Path) -> Path:
-    """Pipe raw mosaic frames into ffmpeg and return the encoded file's path."""
-    first = next(mosaics, None)
+    """Pipe raw mosaic frames into ffmpeg and publish only a complete encode."""
+    source_mosaics = mosaics
+    try:
+        first = next(source_mosaics, None)
+    except BaseException:
+        close = getattr(source_mosaics, "close", None)
+        if close is not None:
+            close()
+        raise
     if first is None:
+        close = getattr(source_mosaics, "close", None)
+        if close is not None:
+            close()
         raise ValueError("the requested source range contains no frames")
-    mosaics = chain((first,), mosaics)
+    mosaics = chain((first,), source_mosaics)
     del first
     width, height = derived.target_dimensions
     # str(Fraction) is "30000/1001", which ffmpeg takes as the exact rate.
-    proc = subprocess.Popen([
+    temporary: Path | None = None
+    proc: subprocess.Popen[bytes] | None = None
+    iterator_error: BaseException | None = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{output_path.stem}.",
+                                         suffix=output_path.suffix,
+                                         dir=output_path.parent)
+        temporary = Path(temp_name)
+        os.close(fd)
+        proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}", "-framerate", str(derived.output_fps),
         "-i", "-",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-y", str(output_path)
-    ], stdin=subprocess.PIPE)
-    assert proc.stdin is not None
+        "-y", str(temporary)
+        ], stdin=subprocess.PIPE)
+        assert proc.stdin is not None
 
-    try:
-        for mosaic in mosaics:
-            proc.stdin.write(mosaic.tobytes())
-    except BrokenPipeError:
-        # ffmpeg died early; its exit code below is the useful error.
-        pass
+        try:
+            for mosaic in mosaics:
+                proc.stdin.write(mosaic.tobytes())
+        except BrokenPipeError:
+            # ffmpeg died early; its exit code below is the useful error.
+            pass
+        except BaseException as error:
+            iterator_error = error
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                # Closing a failed pipe can raise too. Always reap ffmpeg below.
+                pass
+            finally:
+                proc.wait()
+
+        if iterator_error is not None:
+            raise iterator_error
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg encode failed with exit code {proc.returncode}")
+        assert temporary is not None
+        with temporary.open("rb") as encoded:
+            os.fsync(encoded.fileno())
+        os.replace(temporary, output_path)
+        _fsync_parent(output_path)
+        return output_path
     finally:
-        proc.stdin.close()
-        proc.wait()
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg encode failed with exit code {proc.returncode}")
-    return output_path
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        close = getattr(source_mosaics, "close", None)
+        try:
+            if close is not None:
+                close()
+        except BaseException:
+            pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
@@ -1193,13 +1342,26 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
     The source is scaled to the mosaic's size: `hstack` needs equal heights, and
     the two only match by coincidence. See docs/streaming-and-encoding.md.
     """
+    resolved_output = output_path.resolve()
+    for input_path in (source_path, mosaic_path):
+        if resolved_output == input_path.resolve():
+            raise ValueError(f"combined output would overwrite an input: {input_path}")
+        try:
+            if output_path.exists() and input_path.exists() \
+                    and output_path.samefile(input_path):
+                raise ValueError(f"combined output would overwrite an input: {input_path}")
+        except OSError:
+            pass
     width, height = dimensions
     # This is our completed encode, so its count is the actual slice length,
     # even when the source ended before the requested duration.
     cap = cv2.VideoCapture(str(mosaic_path))
     try:
-        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = Fraction(cap.get(cv2.CAP_PROP_FPS)).limit_denominator(1001)
+        raw_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        count = int(raw_count) if isfinite(raw_count) and raw_count > 0 else 0
+        fps = (Fraction(raw_fps).limit_denominator(1001)
+               if isfinite(raw_fps) and raw_fps > 0 else Fraction(0))
     finally:
         cap.release()
     if count <= 0 or fps <= 0:
@@ -1208,7 +1370,16 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
     duration_seconds = f"{float(count / fps):.9f}"
     # Both panes use the same frame clock; mkv timestamps round to milliseconds.
     clock = f"settb=expr=1/({fps}),setpts=N"
-    proc = subprocess.Popen([
+    temporary: Path | None = None
+    proc: subprocess.Popen[str] | None = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{output_path.stem}.",
+                                         suffix=output_path.suffix,
+                                         dir=output_path.parent)
+        temporary = Path(temp_name)
+        os.close(fd)
+        proc = subprocess.Popen([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
         "-progress", "pipe:1",
         "-i", str(source_path),
@@ -1224,27 +1395,54 @@ def combine_videos(source_path: Path, mosaic_path: Path, output_path: Path,
         "-c:v", "libx264",
         "-c:a", "aac",
         "-pix_fmt", "yuv420p",
-        "-y", str(output_path)
-    ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
-    assert proc.stdout is not None
+        "-y", str(temporary)
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+        assert proc.stdout is not None
+        with tqdm.tqdm(desc="Combining videos...", total=total_frames or None,
+                       unit="frame") as bar:
+            # -progress prints key=value lines, and frame= is a running total.
+            for line in proc.stdout:
+                key, _, value = line.partition("=")
+                if key == "frame":
+                    bar.update(int(value) - bar.n)
+        proc.wait()
 
-    with tqdm.tqdm(desc="Combining videos...", total=total_frames or None,
-                   unit="frame") as bar:
-        # -progress prints key=value lines, and frame= is a running total.
-        for line in proc.stdout:
-            key, _, value = line.partition("=")
-            if key == "frame":
-                bar.update(int(value) - bar.n)
-    proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg combine failed with exit code {proc.returncode}")
+        assert temporary is not None
+        with temporary.open("rb") as encoded:
+            os.fsync(encoded.fileno())
+        os.replace(temporary, output_path)
+        _fsync_parent(output_path)
+        return output_path
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg combine failed with exit code {proc.returncode}")
-    return output_path
+
+def _fsync_parent(path: Path) -> None:
+    """Persist a rename where directory handles can be synced (POSIX)."""
+    if os.name == "nt":
+        return
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     """Run the pipeline end to end, returning the combined video's path."""
     output_dir = Path(config.output_dir)
+    inputs = (Path(config.input_dir), *getattr(gallery_source, "input_paths", ()))
+    for output in (output_dir / "output.mp4", output_dir / "combined.mp4"):
+        for source in inputs:
+            if (output.resolve() == source.resolve()
+                    or (output.exists() and source.exists() and output.samefile(source))):
+                raise ValueError(f"output would overwrite an input: {source}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Probe first: the gallery can't load until the cell size is known. Under

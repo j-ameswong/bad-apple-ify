@@ -12,6 +12,9 @@ import subprocess
 import numpy as np
 import pytest
 
+
+import main as app
+
 from conftest import (CELL, make_frames, probe_stream, read_video,
                       write_rated_video, write_video)
 from main import (BrightnessMetric, CifarGallery, DerivedConfig, UserConfig,
@@ -105,9 +108,96 @@ def test_encode_video_raises_when_ffmpeg_fails(tmp_path, cell_gallery):
     width, height = derived.target_dimensions
     mosaics = [mosaic_frame(f, metric) for f in make_frames(2, width, height)]
 
-    # A directory that does not exist: ffmpeg cannot open the output.
+    # ffmpeg cannot infer an output muxer from this suffix.
+    output = tmp_path / "out.invalid"
+    output.write_bytes(b"old complete output")
     with pytest.raises(RuntimeError, match="ffmpeg encode failed"):
-        encode_video(iter(mosaics), derived, tmp_path / "nope" / "out.mp4")
+        encode_video(iter(mosaics), derived, output)
+    assert output.read_bytes() == b"old complete output"
+    assert list(tmp_path.glob(".out.*.invalid")) == []
+
+
+@needs_ffmpeg
+def test_encode_video_iterator_error_keeps_old_output_and_closes_iterator(
+        tmp_path, cell_gallery):
+    derived = _derived_for(CELL)
+    metric = make_metric(cell_gallery)
+    width, height = derived.target_dimensions
+    frame = mosaic_frame(make_frames(1, width, height)[0], metric)
+    closed = []
+    output = tmp_path / "mosaic.mp4"
+    output.write_bytes(b"old complete output")
+
+    def mosaics():
+        try:
+            yield frame
+            raise LookupError("mosaic generation failed")
+        finally:
+            closed.append(True)
+
+    with pytest.raises(LookupError, match="mosaic generation failed"):
+        encode_video(mosaics(), derived, output)
+
+    assert closed == [True]
+    assert output.read_bytes() == b"old complete output"
+    assert list(tmp_path.glob(".mosaic.*.mp4")) == []
+
+
+def test_encode_video_closes_iterator_if_output_setup_fails(tmp_path):
+    derived = _derived_for(CELL)
+    parent = tmp_path / "not-a-directory"
+    parent.write_text("block mkdir")
+    closed = []
+    frame = np.zeros((*derived.target_dimensions[::-1], 3), dtype=np.uint8)
+
+    def mosaics():
+        try:
+            yield frame
+            yield frame
+        finally:
+            closed.append(True)
+
+    with pytest.raises(FileExistsError):
+        encode_video(mosaics(), derived, parent / "mosaic.mp4")
+
+    assert closed == [True]
+
+
+def test_encode_video_reaps_ffmpeg_after_broken_pipe_on_close(
+        tmp_path, monkeypatch):
+    derived = _derived_for(CELL)
+    waited = []
+
+    class BrokenPipe:
+        def write(self, _data):
+            raise BrokenPipeError("write failed")
+
+        def close(self):
+            raise BrokenPipeError("close failed")
+
+    class Process:
+        stdin = BrokenPipe()
+        returncode = None
+
+        def wait(self):
+            waited.append(True)
+            self.returncode = 1
+            return 1
+
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: process)
+    output = tmp_path / "mosaic.mp4"
+    output.write_bytes(b"old complete output")
+    frame = np.zeros((*derived.target_dimensions[::-1], 3), dtype=np.uint8)
+
+    with pytest.raises(RuntimeError, match="ffmpeg encode failed"):
+        encode_video(iter([frame]), derived, output)
+
+    assert waited == [True]
+    assert output.read_bytes() == b"old complete output"
 
 
 @needs_ffmpeg
@@ -134,10 +224,25 @@ def test_combine_videos_raises_when_ffmpeg_fails(tmp_path, video_factory):
     mosaic_path = tmp_path / "mosaic.mkv"
     write_video(mosaic_path, make_frames(2, 32, 24, seed=5))
 
-    # A directory that does not exist: ffmpeg cannot open the output.
+    output = tmp_path / "combined.invalid"
+    output.write_bytes(b"old complete output")
     with pytest.raises(RuntimeError, match="ffmpeg combine failed"):
-        combine_videos(source, mosaic_path, tmp_path / "nope" / "combined.mkv",
-                       (32, 24))
+        combine_videos(source, mosaic_path, output, (32, 24))
+    assert output.read_bytes() == b"old complete output"
+    assert list(tmp_path.glob(".combined.*.invalid")) == []
+
+
+@needs_ffmpeg
+def test_combine_videos_refuses_to_overwrite_input(tmp_path, video_factory):
+    source, _ = video_factory(count=2, width=64, height=48)
+    mosaic_path = tmp_path / "mosaic.mkv"
+    write_video(mosaic_path, make_frames(2, 32, 24, seed=5))
+    source_before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="would overwrite an input"):
+        combine_videos(source, mosaic_path, source, (32, 24))
+
+    assert source.read_bytes() == source_before
 
 
 @needs_ffmpeg
@@ -240,3 +345,24 @@ def _derived_for(cell, grid=(4, 4), fps=30) -> DerivedConfig:
     return DerivedConfig(src_fps=fps, src_dimensions=dimensions,
                          src_frame_count=0, aspect_ratio=grid,
                          grid=grid, cell_size=cell)
+
+
+@pytest.mark.parametrize("name", ["output.mp4", "combined.mp4"])
+def test_pipeline_refuses_to_overwrite_source(tmp_path, name):
+    source = tmp_path / name
+    source.write_bytes(b"original input")
+    config = UserConfig(input_dir=str(source), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="overwrite an input"):
+        main(CifarGallery(tmp_path / "train"), config)
+    assert source.read_bytes() == b"original input"
+
+
+def test_pipeline_refuses_to_overwrite_gallery(tmp_path, video):
+    from main import VideoGallery
+    path, _ = video
+    gallery_path = tmp_path / "output.mp4"
+    gallery_path.write_bytes(b"original gallery")
+    config = UserConfig(input_dir=str(path), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="overwrite an input"):
+        main(VideoGallery(gallery_path), config)
+    assert gallery_path.read_bytes() == b"original gallery"

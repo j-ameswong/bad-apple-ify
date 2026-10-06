@@ -75,6 +75,7 @@ name = "bad-apple"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "opencv-python" },
     { name = "tqdm" },
 ]
@@ -88,6 +89,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2.4.2" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]

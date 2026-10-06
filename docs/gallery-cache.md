@@ -19,7 +19,8 @@ the layout. For `BrightnessMetric` that would mean caching a 10 ms computation
 behind a 38 MB read, so only the tiles are cached today.
 
 `TILE_VERSION` rides along in the key for the things it can't otherwise see.
-The fingerprint covers what went in and the cell size and fit cover the shape,
+The fingerprint covers what went in (path, nanosecond modification time and
+file size for file sources) and the cell size and fit cover the shape,
 but neither says anything about *how* the resize was done, so changing the
 interpolation (v1 to v2, bilinear to INTER_AREA) would have served the old
 pixels forever. Bump it whenever the same inputs start producing different
@@ -34,17 +35,20 @@ byte of tile data is read. A cache written under a bigger `gallery_budget`
 raises `GalleryTooLarge` rather than re-decoding, because the decode would land
 on the same count.
 
-Writes go to a temp file named with the pid and then `replace()` onto the real
-path, so a run killed mid-write leaves the old cache intact rather than a half
-file the next run would have to detect. The temp name keeps its `.npy`
-extension, which `np.save` would otherwise append itself.
+Writes go to a uniquely created temp file in the cache directory and then
+`replace()` onto the real path, so concurrent runs in one process cannot
+overwrite each other's temporary file. A run killed mid-write leaves the old
+cache intact rather than a half file the next run would have to detect. The
+temp name keeps its `.npy` extension, which `np.save` would otherwise append
+itself.
 
 ## Malformed files
 
 Anything short of a whole C-order uint8 `(N, cell_h, cell_w, 3)` array is a miss
 and falls back to a re-decode: a truncated write, a hand-edited array, the wrong
-dtype, a header that won't parse. The key already guarantees the tiles are
-otherwise current, so there's nothing in a bad file worth salvaging.
+dtype, an empty gallery, a header that won't parse. The key already guarantees
+the tiles are otherwise current, so there's nothing in a bad file worth
+salvaging.
 
 The count has to square with the file size, exactly as many bytes behind the
 header as the shape needs, before it gets priced. Price it first and a flipped
@@ -59,7 +63,9 @@ and a read that still comes up short is a miss as well. That takes something
 truncating the file in place after the size check, `cp` over it for one.
 `readinto()` only fills a C-order array, which is why Fortran order is refused
 rather than handled. `np.save` only writes it for a Fortran-ordered array, and
-no source hands one over.
+no source hands one over. After a source loads, `load_gallery()` checks the
+actual non-empty array shape, dtype and byte count as well; this catches a
+source whose count estimate was too low or whose output breaks the protocol.
 
 numpy's header parser means to raise `ValueError` on a bad header, and mostly
 does. Flip each of the 1024 bits in a real 50000-tile header one at a time,

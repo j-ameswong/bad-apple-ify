@@ -48,9 +48,13 @@ layering are still PLAN.md 2.8.
 ## The encode pipe
 
 `encode_video()` writes raw `bgr24` frames into an ffmpeg stdin pipe, so no
-intermediate PNGs ever hit disk. If ffmpeg dies early the writes raise
-`BrokenPipeError`; that's swallowed because ffmpeg's own exit code is the useful
-error, not the write failure it caused.
+intermediate PNGs ever hit disk. If ffmpeg dies early, the write or pipe close
+can raise `BrokenPipeError`; ffmpeg is still waited for so its exit status is
+collected. Both encode and combine write to a temporary file beside the final
+path, then replace the final file only after ffmpeg succeeds. A failed encode or
+an interrupted mosaic iterator leaves any previous output intact. On POSIX the
+parent directory is synced after the rename; Windows doesn't allow this
+directory sync.
 
 ## The frame rate stays a fraction
 

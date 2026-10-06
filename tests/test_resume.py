@@ -144,3 +144,21 @@ def test_corrupt_segment_is_rejected(tmp_path, video_factory, gallery):
     with pytest.raises(ValueError, match="missing or corrupt"):
         segments.encode_segmented(FakeGallery(), config, derived, new_metric,
                                   output)
+
+
+def test_manifest_rejects_boolean_frame_count(tmp_path, video_factory, gallery):
+    import json
+
+    _, output, config, derived, metric = setup_run(
+        tmp_path, video_factory, gallery, count=4, segment_frames=2)
+    segments.encode_segmented(FakeGallery(), config, derived, metric, output)
+    manifest_path = output.parent / "segments" / "checkpoint.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["segments"][0]["frames"] = True
+    manifest_path.write_text(json.dumps(manifest))
+
+    new_metric = build_metric(main.resize_gallery_to_cells(
+        gallery, derived.cell_size), config, derived)
+    with pytest.raises(ValueError, match="invalid frame count"):
+        segments.encode_segmented(FakeGallery(), config, derived, new_metric,
+                                  output)

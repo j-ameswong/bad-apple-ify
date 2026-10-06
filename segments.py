@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import fields
-import fcntl
 import hashlib
 from itertools import chain
 import json
@@ -18,6 +17,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Any, Generator, Iterator, cast
+
+try:
+    import fcntl
+except ImportError:  # Windows uses msvcrt's byte-range locks.
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
+else:
+    msvcrt = None  # type: ignore[assignment]
 
 import cv2
 import numpy as np
@@ -39,6 +46,8 @@ def _sha256(path: Path) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -169,20 +178,41 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 @contextmanager
 def _job_lock(path: Path) -> Iterator[None]:
-    """Hold an OS lock for the whole run; the lock file itself can persist."""
+    """Hold a POSIX or Windows OS lock for the whole run."""
     with path.open("a+b") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(f"another segmented encode is active ({path})") from error
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError(
+                    f"another segmented encode is active ({path})") from error
+        else:
+            handle.seek(0)
+            if handle.read(1) == b"":
+                handle.seek(0)
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                assert msvcrt is not None
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise RuntimeError(
+                    f"another segmented encode is active ({path})") from error
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                assert msvcrt is not None
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _load_manifest(manifest_path: Path, expected: dict[str, Any],
-                   expected_digest: str, segment_dir: Path
+                   expected_digest: str, segment_dir: Path,
+                   expected_segment_frames: int, max_frames: int | None
                    ) -> tuple[list[dict[str, Any]], int, Path | None]:
     if not manifest_path.exists():
         return [], 0, None
@@ -210,16 +240,27 @@ def _load_manifest(manifest_path: Path, expected: dict[str, Any],
         if not segment_path.is_file() or _sha256(segment_path) != record.get("sha256"):
             raise ValueError(f"completed segment is missing or corrupt: {segment_path}")
         frame_count = record.get("frames")
-        if not isinstance(frame_count, int) or frame_count <= 0:
+        if (not isinstance(frame_count, int) or isinstance(frame_count, bool)
+                or frame_count <= 0 or frame_count > expected_segment_frames):
             raise ValueError(f"completed segment has an invalid frame count: {segment_path}")
+        if index < len(records) - 1 and frame_count != expected_segment_frames:
+            raise ValueError(f"non-final segment has an invalid frame count: {segment_path}")
+        if not isinstance(record.get("sha256"), str):
+            raise ValueError(f"completed segment has an invalid hash: {segment_path}")
         completed += frame_count
-    if manifest.get("completed_frames") != completed:
+    declared_completed = manifest.get("completed_frames")
+    if (not isinstance(declared_completed, int) or isinstance(declared_completed, bool)
+            or declared_completed != completed):
         raise ValueError("resume checkpoint frame total does not match its segments")
+    if max_frames is not None and completed > max_frames:
+        raise ValueError("resume checkpoint contains more frames than the requested range")
     state_name = manifest.get("state_file")
     state_path = None
     if records:
         if not isinstance(state_name, str) or Path(state_name).name != state_name:
             raise ValueError("resume checkpoint has an invalid metric-state path")
+        if state_name != f"state_{len(records):08d}.npz":
+            raise ValueError("resume checkpoint metric state does not match its segments")
         state_path = segment_dir / state_name
         if not state_path.is_file():
             raise ValueError(f"metric state is missing: {state_path}")
@@ -233,6 +274,7 @@ def _seek_frames(config: UserConfig, derived: DerivedConfig,
     """Seek directly to an absolute source frame and verify OpenCV's position."""
     cap = cv2.VideoCapture(config.input_dir)
     if not cap.isOpened():
+        cap.release()
         raise ValueError(f"Video at {config.input_dir} not found!")
     try:
         if not cap.set(cv2.CAP_PROP_POS_FRAMES, start):
@@ -279,7 +321,9 @@ def encode_segmented(source: GallerySource, config: UserConfig,
 
     with _job_lock(segment_dir / ".encode.lock"):
         records, completed, state_path = _load_manifest(
-            manifest_path, identity, identity_digest, segment_dir)
+            manifest_path, identity, identity_digest, segment_dir, segment_frames,
+            (derived.stop_frame - derived.start_frame
+             if derived.stop_frame is not None else None))
         if state_path is None:
             warmup = derived.start_frame if config.candidates > 1 else 0
             frames = cast(Generator[Image, None, None], stream_frames(
