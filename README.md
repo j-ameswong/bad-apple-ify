@@ -15,6 +15,14 @@ bad-apple-ify rebuilds each frame of a video as a mosaic. It matches every
 video cell to an image from a gallery, then writes both the mosaic and a
 side-by-side video with the original audio.
 
+## Browser app
+
+[Mosaic studio](https://bad-apple-mosaic-studio.wongchengan.chatgpt.site) runs
+the pipeline locally in a browser, with file selection, previews, downloads
+and exported resume checkpoints. Selected media is never uploaded. It supports
+the matching and geometry controls below, with browser-dependent codecs and a
+256 MiB default tile budget. Use a desktop browser with WebCodecs support.
+
 ## Requirements and setup
 
 - Python 3.14 or later
