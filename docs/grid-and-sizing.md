@@ -3,6 +3,28 @@
 `DerivedConfig.from_source()` turns a source video's dimensions into a grid, a
 cell size, and a target frame size. Four decisions live in there.
 
+## Explicit output sizing
+
+`UserConfig.cell_size` and `UserConfig.grid` decouple the mosaic dimensions
+from source resolution. `cell_size` is the cell height in pixels; `grid` is
+`(columns, rows)`. Set both to make the output exactly `columns × cell_width`
+by `rows × cell_height`. If only `grid` is set, the cell is sized from the
+source dimensions. If only `cell_size` is set, the grid comes from the source's
+integer aspect pair and `grid_size`, so two sources with the same aspect ratio
+produce the same output at different resolutions.
+
+With `tile_fit="native"`, an explicit cell height determines cell width from
+the gallery's native aspect ratio. `crop` and `stretch` use a square cell. In
+single-frame mode (`grid_size=1`), native sizing follows the source frame's
+aspect ratio and the tile is cropped into that frame, as before. With no
+explicit sizing fields, the existing source-derived dimensions and even-span
+adjustments are unchanged.
+
+The encoder uses `yuv420p`, so each output side must be even. Explicit sizing
+that produces an odd side raises `ValueError`; it won't silently change a
+requested grid or cell size. Sizing inputs must be positive integers, excluding
+booleans.
+
 ## The aspect ratio comes from the source
 
 The grid needs *some* integer pair to multiply by `grid_size`. Rather than
