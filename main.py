@@ -4,6 +4,7 @@ import numpy as np
 import numpy.typing as npt
 import cv2
 import tqdm
+import glob
 import hashlib
 import os
 import pickle
@@ -432,20 +433,33 @@ class VideoGallery:
     `stride`-th frame. See docs/video-gallery.md."""
 
     def __init__(self, path: Path, stride: int = 10):
+        if isinstance(stride, bool) or not isinstance(stride, int) or stride <= 0:
+            raise ValueError("video gallery stride must be a positive integer")
         self._path = Path(path)
         self._stride = stride
         self._count: int | None = None
         self._counted = False
 
     def _files(self) -> list[Path]:
-        """The videos this gallery reads, in a stable order."""
+        """Return existing video files in stable order, rejecting empty inputs."""
         if self._path.is_dir():
             # Dotfiles are skipped for the AppleDouble `._name.mkv` stubs a rip
             # off a Mac leaves behind: right suffix, 4 KB of resource fork.
-            return sorted(p for p in self._path.iterdir()
-                          if p.suffix.lower() in VIDEO_SUFFIXES
-                          and not p.name.startswith("."))
-        return [self._path]
+            files = sorted(p for p in self._path.iterdir()
+                           if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
+                           and not p.name.startswith("."))
+        elif glob.has_magic(str(self._path)):
+            matches = (Path(match) for match in glob.glob(str(self._path), recursive=True))
+            files = sorted(path for path in matches
+                           if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+                           and not path.name.startswith("."))
+        elif self._path.is_file():
+            files = [self._path]
+        else:
+            raise ValueError(f"Video gallery path not found: {self._path}")
+        if not files:
+            raise ValueError(f"No videos found at {self._path}")
+        return files
 
     @property
     def fingerprint(self) -> str:
@@ -460,8 +474,6 @@ class VideoGallery:
         to fit them all, which no single ratio does.
         """
         files = self._files()
-        if not files:
-            return None
         cap = cv2.VideoCapture(str(files[0]))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -486,6 +498,9 @@ class VideoGallery:
         total = 0
         for path in self._files():
             cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                cap.release()
+                raise ValueError(f"Video at {path} could not be opened!")
             frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
             if frames <= 0:
                 # Nothing in the container; seek to the end for a duration instead.
@@ -507,9 +522,6 @@ class VideoGallery:
         costs more than decoding past what we skip. See docs/video-gallery.md.
         """
         files = self._files()
-        if not files:
-            raise ValueError(f"No videos found at {self._path}")
-
         buffer = TileBuffer(self.estimate_count() or FALLBACK_CAPACITY,
                             cell_size, budget)
         seen: set[bytes] = set()
@@ -1285,7 +1297,6 @@ def parse_config(argv: list[str] | None = None) -> UserConfig:
 
 
 if __name__ == "__main__":
-    # Swap in VideoGallery(Path("./assets/videos"), stride=10) for your own
-    # videos. CIFAR stays the default because the README has you download it.
-    main(CifarGallery(Path("./assets/gallery/train")),
-         parse_config())
+    from cli import cli_main
+
+    raise SystemExit(cli_main())

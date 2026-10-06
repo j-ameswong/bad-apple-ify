@@ -582,6 +582,12 @@ byte-identical to one entry in `metric.tiles`.
 
 ### 2.5 Decouple output resolution from source
 
+**Landed (2026-10-06).** `--grid COLSxROWS` and `--cell-size` allow explicit
+output sizing. Cell size is the height in pixels; native tiles derive their
+width from the gallery ratio, while crop/stretch use square cells. Explicit
+dimensions must be even for yuv420p. Omitting both preserves existing sizing.
+See [grid and sizing](docs/grid-and-sizing.md).
+
 Cell size is currently derived as `src_dimensions / grid`, which caps tile
 detail at whatever the source happens to be — a 512×384 source with a 32×24
 grid gives 16px tiles and no way to ask for more.
@@ -608,6 +614,11 @@ resolution.
 ---
 
 ### 2.6 Segmented encode & resume
+
+**Landed (2026-10-06).** Atomic segment checkpoints include random-generator
+and held-tile state. Resume validates completed parts and seeks to the first
+unfinished source frame. `--segment 5000` is the CLI default; `--segment 0`
+selects a single encode. See [resume](docs/resume.md).
 
 A 130k-frame run dying at frame 100k is expensive, and 0.2's ffmpeg pipe removes
 the accidental checkpointing the intermediate PNGs provided.
@@ -642,6 +653,13 @@ Notes in `docs/streaming-and-encoding.md`; `tests/test_slice.py` checks the
 ---
 
 ### 2.8 CLI + config file
+
+**Landed (2026-10-06).** The CLI loads optional `config.toml`, supports explicit
+`--config`, and applies flags last. Source and gallery are required. Video
+globs, cache/budget controls and a probe-only dry run are supported. Defaults
+retain native tile fit and expose candidates, epsilon and colour bins as well
+as the originally planned flags. See [CLI usage](docs/cli.md) and
+[the example configuration](config.example.toml).
 
 Use `argparse` with a TOML config file as the base layer:
 

@@ -1,0 +1,25 @@
+# Copy this to config.toml, then adjust the paths for your files.
+source = "./assets/source.mp4"
+gallery = "./assets/gallery/train"
+# gallery_type = "cifar" # or "video"; otherwise inferred from path
+
+output_dir = "./output"
+grid_size = 8
+# grid = "32x24" # fixed columns x rows, when supported by the selected pipeline
+# cell_size = 16
+tile_fit = "native"
+contrast = 0.8
+metric = "colour"
+candidates = 256
+epsilon = 0.005
+colour_bins = 32
+stochastic = true
+seed = 0
+hold_tiles = true
+start = 0.0
+# duration = 10.0
+stride = 10
+segment = 5000
+use_cache = true
+gallery_budget = "8G"
+# dry_run = true

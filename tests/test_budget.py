@@ -92,10 +92,11 @@ def test_video_estimate_sums_over_a_directory(tmp_path):
     assert VideoGallery(tmp_path, stride=5).estimate_count() == 6
 
 
-def test_video_estimate_is_none_when_nothing_can_be_read(tmp_path):
+def test_video_estimate_rejects_an_unreadable_video(tmp_path):
     (tmp_path / "broken.mkv").write_bytes(b"not a video at all")
 
-    assert VideoGallery(tmp_path / "broken.mkv").estimate_count() is None
+    with pytest.raises(ValueError, match="could not be opened"):
+        VideoGallery(tmp_path / "broken.mkv").estimate_count()
 
 
 def test_a_lying_estimate_is_caught_on_the_way_up(tmp_path, monkeypatch):

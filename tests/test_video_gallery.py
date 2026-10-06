@@ -91,8 +91,9 @@ def test_native_aspect_is_the_frame_shape(video_factory):
     assert VideoGallery(path).native_aspect == (4, 3)
 
 
-def test_native_aspect_of_nothing_is_none(tmp_path):
-    assert VideoGallery(tmp_path).native_aspect is None
+def test_native_aspect_of_empty_directory_is_an_error(tmp_path):
+    with pytest.raises(ValueError, match="No videos found"):
+        _ = VideoGallery(tmp_path).native_aspect
 
 
 def test_fingerprint_tracks_stride_and_files(tmp_path, video_factory):
@@ -101,6 +102,49 @@ def test_fingerprint_tracks_stride_and_files(tmp_path, video_factory):
 
     assert VideoGallery(path, 10).fingerprint != VideoGallery(path, 5).fingerprint
     assert VideoGallery(path, 10).fingerprint != VideoGallery(other, 10).fingerprint
+
+
+def test_glob_loads_stable_matching_files_and_fingerprints_them(tmp_path, video_factory):
+    _, first = video_factory(count=3, seed=1)
+    _, second = video_factory(count=3, seed=2)
+    write_video(tmp_path / "ep1.mkv", first)
+    write_video(tmp_path / "ep2.mkv", second)
+    (tmp_path / "._ep1.mkv").write_bytes(b"not a video")
+    fake_dir = tmp_path / "ep3.mkv"
+    fake_dir.mkdir()
+    (tmp_path / "notes.txt").write_text("ignored")
+
+    gallery = VideoGallery(tmp_path / "ep[12].mkv", stride=2)
+    tiles = gallery.load(CELL, fit="stretch")
+    expected = np.concatenate([first[::2], second[::2]])
+
+    np.testing.assert_array_equal(
+        tiles, resize_gallery_to_cells(expected, CELL, "stretch"))
+    assert gallery.estimate_count() == 4
+    assert "ep1.mkv" in gallery.fingerprint
+    assert "ep2.mkv" in gallery.fingerprint
+    assert "ep3.mkv" not in gallery.fingerprint
+
+
+@pytest.mark.parametrize("stride", [0, -1, True, 1.5])
+def test_stride_must_be_a_positive_nonbool_integer(tmp_path, stride):
+    with pytest.raises(ValueError, match="stride"):
+        VideoGallery(tmp_path / "missing.mkv", stride=stride)
+
+
+def test_unmatched_glob_fails_before_estimation(tmp_path):
+    gallery = VideoGallery(tmp_path / "missing-?.mkv")
+
+    with pytest.raises(ValueError, match="No videos found"):
+        gallery.estimate_count()
+
+
+def test_unreadable_video_fails_before_returning_unknown_count(tmp_path):
+    path = tmp_path / "broken.mkv"
+    path.write_bytes(b"not a video")
+
+    with pytest.raises(ValueError, match="could not be opened"):
+        VideoGallery(path).estimate_count()
 
 
 # --- fitting a 16:9 frame into a cell that isn't 16:9 -----------------------
