@@ -1244,14 +1244,20 @@ def main(gallery_source: GallerySource, config: UserConfig) -> Path:
     # alive beside the metric's own copy for the rest of the run.
     metric = build_metric(
         load_gallery(gallery_source, derived, fit=config.tile_fit,
-                     budget=config.gallery_budget),
+                     budget=config.gallery_budget, use_cache=config.use_cache),
         config, derived)
 
     # Reproduce the full run's RNG and held tiles, without assembling its prefix.
-    warmup = derived.start_frame if config.candidates > 1 else 0
-    frames = stream_frames(config, derived, include_prefix=bool(warmup))
-    mosaics = build_mosaics(frames, metric, derived, warmup_frames=warmup)
-    mosaic_path = encode_video(mosaics, derived, output_dir / "output.mp4")
+    if config.segment_frames:
+        from segments import encode_segmented
+
+        mosaic_path = encode_segmented(gallery_source, config, derived, metric,
+                                       output_dir / "output.mp4")
+    else:
+        warmup = derived.start_frame if config.candidates > 1 else 0
+        frames = stream_frames(config, derived, include_prefix=bool(warmup))
+        mosaics = build_mosaics(frames, metric, derived, warmup_frames=warmup)
+        mosaic_path = encode_video(mosaics, derived, output_dir / "output.mp4")
 
     combined = combine_videos(Path(config.input_dir), mosaic_path,
                               output_dir / "combined.mp4",
